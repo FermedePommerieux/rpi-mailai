@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.venv/
+venv/
+data/
+config/secrets/
+config/*.yml
+!.gitkeep
+*.log
+*.tmp
+*.bak
+.vscode/
+.idea/

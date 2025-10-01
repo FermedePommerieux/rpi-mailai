@@ -1,0 +1,28 @@
+services:
+  rpi-mailai:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: rpi-mailai:latest
+    container_name: rpi-mailai
+    restart: unless-stopped
+    init: true
+    # If DNS is flaky, uncomment one of the following:
+    # network_mode: host
+    # dns:
+    #   - 1.1.1.1
+    #   - 8.8.8.8
+    environment:
+      APP_CONFIG: /config/config.yml
+      DATA_DIR: /data
+      POLL_EVERY: 600
+      RETRAIN_TIME: "03:10:00"
+    volumes:
+      - ./config:/config
+      - ./data:/data
+    healthcheck:
+      test: ["CMD-SHELL","pgrep -f 'python /app/mailai.py' || exit 1"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
