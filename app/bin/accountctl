@@ -1,10 +1,137 @@
 #!/usr/bin/env python3
-import argparse, getpass, os, sys, yaml, re
+import argparse, getpass, json, os, re, sys, yaml
+from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from imapclient import IMAPClient
 
 CFG_PATH = Path(os.environ.get("APP_CONFIG", "/config/config.yml"))
 SECRETS_DIR = Path("/config/secrets")
+MAIL_TYPES_DIR = Path(os.environ.get("MAIL_TYPES_DIR", "/config/account_types"))
+
+GENERIC_PROMPTS = {
+    "important": (
+        "Classer dans le dossier Important tout message nécessitant une action rapide, "
+        "lié à des responsables, des clients ou des demandes urgentes."
+    ),
+    "newsletter": (
+        "Identifier les newsletters, campagnes marketing, promotions commerciales et les "
+        "emails automatisés d'information générique."
+    ),
+    "projet": (
+        "Détecter les emails liés aux projets en cours : échanges d'équipe, comptes rendus, "
+        "plans d'action, livrables ou demandes de suivi."
+    ),
+    "basse": (
+        "Repérer les notifications de réseaux sociaux, invitations automatiques et autres "
+        "messages de faible priorité."
+    ),
+    "quarantine": (
+        "Utiliser la quarantaine pour tout message ambigu ou incertain afin d'attendre une "
+        "revue manuelle."
+    ),
+    "factures": (
+        "Repérer les mails contenant une facture à traiter : expéditeur de type fournisseur, "
+        "mention explicite de facture ou facturation et présence d'une pièce jointe PDF."
+    ),
+}
+
+
+def _write_mail_types(path: Path, payload: dict):
+    payload["updated_at"] = datetime.utcnow().isoformat()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(payload, fh, indent=2, ensure_ascii=False)
+    os.replace(tmp, path)
+
+
+def _sync_targets(payload: dict, mapping_targets: dict, spam_folder: str, quarantine_folder: str):
+    for entry in payload.get("types", []):
+        key = entry.get("key")
+        if key == "spam" and spam_folder:
+            entry["target_folder"] = spam_folder
+        elif key == "quarantine" and quarantine_folder:
+            entry["target_folder"] = quarantine_folder
+        elif key in mapping_targets and mapping_targets.get(key):
+            entry["target_folder"] = mapping_targets[key]
+        elif key == "factures":
+            # Default invoices to the project folder if nothing else is set
+            if not entry.get("target_folder"):
+                entry["target_folder"] = mapping_targets.get("projet") or quarantine_folder or spam_folder
+
+
+def ensure_mail_types(
+    name: str,
+    mapping_targets: dict,
+    spam_folder: str,
+    quarantine_folder: str,
+    existing_path: Optional[str] = None,
+) -> Path:
+    base_payload = {
+        "account": name,
+        "version": 1,
+        "types": [
+            {
+                "key": "important",
+                "label": "Important",
+                "enabled": True,
+                "target_folder": mapping_targets.get("important"),
+                "prompt": GENERIC_PROMPTS["important"],
+            },
+            {
+                "key": "newsletter",
+                "label": "Newsletters",
+                "enabled": False,
+                "target_folder": mapping_targets.get("newsletter"),
+                "prompt": GENERIC_PROMPTS["newsletter"],
+            },
+            {
+                "key": "projet",
+                "label": "Projets",
+                "enabled": False,
+                "target_folder": mapping_targets.get("projet"),
+                "prompt": GENERIC_PROMPTS["projet"],
+            },
+            {
+                "key": "basse",
+                "label": "Faible priorité",
+                "enabled": False,
+                "target_folder": mapping_targets.get("basse"),
+                "prompt": GENERIC_PROMPTS["basse"],
+            },
+            {
+                "key": "quarantine",
+                "label": "Quarantaine",
+                "enabled": False,
+                "target_folder": quarantine_folder,
+                "prompt": GENERIC_PROMPTS["quarantine"],
+            },
+            {
+                "key": "factures",
+                "label": "Factures à traiter",
+                "enabled": False,
+                "target_folder": mapping_targets.get("projet") or quarantine_folder,
+                "prompt": GENERIC_PROMPTS["factures"],
+            },
+        ],
+    }
+
+    path = Path(existing_path) if existing_path else MAIL_TYPES_DIR / f"{name}.json"
+    if path.exists():
+        with open(path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        # Merge missing defaults without overwriting user customisations
+        existing_keys = {t.get("key") for t in payload.get("types", [])}
+        for t in base_payload["types"]:
+            if t["key"] not in existing_keys:
+                payload.setdefault("types", []).append(t)
+    else:
+        payload = base_payload
+
+    _sync_targets(payload, mapping_targets, spam_folder, quarantine_folder)
+    _write_mail_types(path, payload)
+    return path
 
 def load_cfg():
     if not CFG_PATH.exists():
@@ -121,6 +248,8 @@ def add_account(args):
 
     secret_file.write_text(pwd); os.chmod(secret_file, 0o600)
 
+    types_path = ensure_mail_types(name, mapping_targets, spam_f_n, quarantine_f_n)
+
     new_acc = {
         "name": name,
         "imap": {
@@ -139,6 +268,7 @@ def add_account(args):
             "spam":  spam_f_n,
             "targets": mapping_targets
         },
+        "mail_types_config": str(types_path),
         "rules": []
     }
     accs.append(new_acc); save_cfg(cfg)
@@ -164,7 +294,6 @@ def update_account(args):
     if args.ssl is True:      acc["imap"]["ssl"] = True
 
     if any([args.spam, args.important, args.newsletter, args.projet, args.basse, args.quarantine]):
-        from pathlib import Path
         pwd = Path(acc["imap"]["password_file"]).read_text().strip()
         with IMAPClient(acc["imap"]["host"], port=acc["imap"]["port"], ssl=acc["imap"].get("ssl",True)) as srv:
             srv.login(acc["imap"]["user"], pwd)
@@ -190,6 +319,12 @@ def update_account(args):
     if args.auto_spam: acc["mode"]["auto_spam"] = True
     if args.no_spam:   acc["mode"]["auto_spam"] = False
 
+    targets = acc.get("folders", {}).setdefault("targets", {})
+    spam_folder = acc.get("folders", {}).get("spam")
+    quarantine_folder = targets.get("quarantine")
+    types_path = ensure_mail_types(args.name, targets, spam_folder, quarantine_folder, acc.get("mail_types_config"))
+    acc["mail_types_config"] = str(types_path)
+
     if args.rotate_password:
         secret_path = Path(acc["imap"]["password_file"])
         SECRETS_DIR.mkdir(parents=True, exist_ok=True)
@@ -208,10 +343,17 @@ def remove_account(args):
     if acc is None:
         print(f"Account '{args.name}' not found.", file=sys.stderr); sys.exit(2)
     secret = acc["imap"].get("password_file")
+    types_cfg = acc.get("mail_types_config")
     del cfg["accounts"][idx]; save_cfg(cfg)
     if args.delete_secret and secret:
         try: Path(secret).unlink(); print(f"[OK] Secret removed: {secret}")
         except FileNotFoundError: pass
+    if types_cfg:
+        try:
+            Path(types_cfg).unlink()
+            print(f"[OK] Mail types config removed: {types_cfg}")
+        except FileNotFoundError:
+            pass
     print(f"[OK] Account '{args.name}' removed.")
 
 def list_accounts(_args):
@@ -225,6 +367,8 @@ def list_accounts(_args):
               f"[Spam={a['folders'].get('spam')}, Important={t.get('important')}, "
               f"Promotions={t.get('newsletter')}, Social={t.get('basse')}, "
               f"Projects={t.get('projet')}, Quarantine={t.get('quarantine')}]")
+        if a.get("mail_types_config"):
+            print(f"    mail_types_config={a['mail_types_config']}")
 
 def test_account(args):
     cfg = load_cfg(); _idx, acc = find_acc(cfg, args.name)

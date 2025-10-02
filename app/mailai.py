@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os, sys, time, yaml, sqlite3, email, re, random
 from datetime import datetime
 from pathlib import Path
@@ -12,6 +13,7 @@ import numpy as np
 # === CONFIG PATHS ===
 CFG_PATH = Path(os.environ.get("APP_CONFIG", "/config/config.yml"))
 DATA_DIR = Path(os.environ.get("DATA_DIR", "/data"))
+MAIL_TYPES_DIR = Path(os.environ.get("MAIL_TYPES_DIR", "/config/account_types"))
 DB_PATH = DATA_DIR / "db" / "mailai.sqlite"
 MODEL_DIR = DATA_DIR / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
@@ -46,6 +48,29 @@ def clean_text(s):
 def vectorize(texts, encoder):
     emb = encoder.encode(texts, show_progress_bar=False)
     return np.array(emb)
+
+
+def load_account_mail_types(acc):
+    if not acc:
+        return {}
+    cfg_path = acc.get("mail_types_config")
+    if not cfg_path:
+        default_path = MAIL_TYPES_DIR / f"{acc['name']}.json"
+        cfg_path = default_path if default_path.exists() else None
+    if not cfg_path:
+        return {}
+    try:
+        with open(cfg_path, "r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+    except FileNotFoundError:
+        return {}
+    except json.JSONDecodeError as exc:
+        print(f"[WARN] invalid mail types JSON for {acc['name']}: {exc}")
+        return {}
+    entries = payload.get("types", [])
+    index = {e.get("key"): e for e in entries if e.get("key")}
+    enabled = {k for k, v in index.items() if v.get("enabled", True)}
+    return {"path": str(cfg_path), "entries": index, "enabled": enabled}
 
 # === PIPELINE STEPS ===
 def snapshot(cfg):
@@ -105,20 +130,53 @@ def predict(cfg, auto_move=False):
     Xv = vectorize(X, encoder)
     probs = clf.predict_proba(Xv)
     preds = clf.classes_[np.argmax(probs, axis=1)]
+    accounts_map = {a["name"]: a for a in cfg.get("accounts", [])}
+    mail_types_cache = {}
+    min_conf = float(cfg.get("model", {}).get("min_auto_move_confidence", 0.85))
+
     for (id_,_,_,account),p,label in zip(rows,probs,preds):
         conf = np.max(p)
         decision = label
         cur.execute("UPDATE mails SET decision=?,confidence=? WHERE id=?",(decision,float(conf),id_))
-        print(f"[predict] {account} -> {decision} ({conf:.2f})")
-        if auto_move and conf>0.85:
-            acc = next(a for a in cfg["accounts"] if a["name"]==account)
-            imap = acc["imap"]; pwd = Path(imap["password_file"]).read_text().strip()
-            with IMAPClient(imap["host"], port=imap["port"], ssl=imap["ssl"]) as srv:
-                srv.login(imap["user"], pwd)
-                try:
-                    target = acc["folders"]["targets"].get(decision)
-                    if target: srv.move([id_], target)
-                except Exception as e: print(f"[move] {e}")
+        acc = accounts_map.get(account)
+        mail_types = mail_types_cache.get(account)
+        if mail_types is None:
+            mail_types = load_account_mail_types(acc)
+            mail_types_cache[account] = mail_types
+
+        entries = mail_types.get("entries", {}) if mail_types else {}
+        enabled = mail_types.get("enabled", set()) if mail_types else set()
+        entry = entries.get(decision)
+
+        log_msg = f"[predict] {account} -> {decision} ({conf:.2f})"
+        if enabled and decision not in enabled:
+            print(log_msg + " [désactivé dans config]")
+            continue
+        if entry and not entry.get("enabled", True):
+            print(log_msg + " [règle désactivée]")
+            continue
+
+        print(log_msg)
+
+        if not (auto_move and acc and acc.get("mode", {}).get("auto_move", False) and conf > min_conf):
+            continue
+
+        imap = acc["imap"]; pwd = Path(imap["password_file"]).read_text().strip()
+        target = None
+        if entry:
+            target = entry.get("target_folder") or acc.get("folders", {}).get("targets", {}).get(decision)
+        else:
+            target = acc.get("folders", {}).get("targets", {}).get(decision)
+
+        if not target:
+            continue
+
+        with IMAPClient(imap["host"], port=imap["port"], ssl=imap["ssl"]) as srv:
+            srv.login(imap["user"], pwd)
+            try:
+                srv.move([id_], target)
+            except Exception as e:
+                print(f"[move] {e}")
     conn.commit(); conn.close()
 
 def loop(cfg):
