@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 import json
 import os, sys, time, yaml, sqlite3, email, re, random
-from datetime import datetime
+from collections import defaultdict
+from datetime import datetime, timedelta
 from pathlib import Path
 from imapclient import IMAPClient
 from mailparser import parse_from_bytes
@@ -33,8 +34,21 @@ def db_init():
         id INTEGER PRIMARY KEY,
         account TEXT, msgid TEXT, subject TEXT, body TEXT,
         folder TEXT, date TEXT, decision TEXT, confidence REAL,
+        imap_uid TEXT, last_seen_at TEXT, auto_moved INTEGER DEFAULT 0,
+        auto_moved_at TEXT,
         UNIQUE(account,msgid)
     )""")
+    # legacy database migrations
+    c.execute("PRAGMA table_info(mails)")
+    cols = {row[1] for row in c.fetchall()}
+    if "imap_uid" not in cols:
+        c.execute("ALTER TABLE mails ADD COLUMN imap_uid TEXT")
+    if "last_seen_at" not in cols:
+        c.execute("ALTER TABLE mails ADD COLUMN last_seen_at TEXT")
+    if "auto_moved" not in cols:
+        c.execute("ALTER TABLE mails ADD COLUMN auto_moved INTEGER DEFAULT 0")
+    if "auto_moved_at" not in cols:
+        c.execute("ALTER TABLE mails ADD COLUMN auto_moved_at TEXT")
     c.execute("""CREATE TABLE IF NOT EXISTS models (
         id INTEGER PRIMARY KEY, version TEXT, trained_at TEXT
     )""")
@@ -48,6 +62,17 @@ def clean_text(s):
 def vectorize(texts, encoder):
     emb = encoder.encode(texts, show_progress_bar=False)
     return np.array(emb)
+
+
+def canonical_folder_name(name: str) -> str:
+    if not name:
+        return ""
+    if isinstance(name, bytes):
+        name = name.decode("utf-8", "ignore")
+    cleaned = name.replace("\"", "").replace("'", "")
+    cleaned = cleaned.replace(".", "/").replace("\\", "/")
+    cleaned = re.sub(r"/+", "/", cleaned)
+    return cleaned.strip().upper()
 
 
 def load_account_mail_types(acc):
@@ -72,27 +97,226 @@ def load_account_mail_types(acc):
     enabled = {k for k, v in index.items() if v.get("enabled", True)}
     return {"path": str(cfg_path), "entries": index, "enabled": enabled}
 
+
+def _resolve_entry_folders(account_cfg, entry):
+    folders = set()
+    if not entry:
+        return folders
+    raw = entry.get("source_folders") or []
+    if isinstance(raw, str):
+        raw = [raw]
+    for item in raw:
+        if item:
+            folders.add(item)
+    target = entry.get("target_folder")
+    if not target:
+        target = account_cfg.get("folders", {}).get("targets", {}).get(entry.get("key"))
+    if target:
+        folders.add(target)
+    return folders
+
+
+def _collect_archive_roots(account_cfg):
+    roots = set()
+    folders_cfg = account_cfg.get("folders", {}) if account_cfg else {}
+    archive_values = []
+    for key in ("archive", "archives", "archive_root", "archive_roots"):
+        val = folders_cfg.get(key)
+        if isinstance(val, list):
+            archive_values.extend(val)
+        elif val:
+            archive_values.append(val)
+    for item in archive_values:
+        if item:
+            roots.add(canonical_folder_name(item))
+    return roots
+
+
+def _is_archive_folder(folder, archive_roots):
+    canon = canonical_folder_name(folder)
+    if not canon:
+        return False
+    if canon in archive_roots:
+        return True
+    parts = [p for p in canon.split("/") if p]
+    if any(p.startswith("ARCHIVE") or p.endswith("ARCHIVE") for p in parts):
+        return True
+    for root in archive_roots:
+        if root and (canon == root or canon.startswith(f"{root}/")):
+            return True
+    return False
+
 # === PIPELINE STEPS ===
 def snapshot(cfg):
     conn = db_init()
     cur = conn.cursor()
+    delete_pref_keys = {"SPAM", "INDESIRABLE", "JUNK", "PROMOTION", "PROMOTIONS", "NEWSLETTER"}
     for acc in cfg.get("accounts", []):
-        print(f"{datetime.now()} [{acc['name']}] snapshot...")
-        imap = acc["imap"]; pwd = Path(imap["password_file"]).read_text().strip()
+        account_name = acc.get("name")
+        if not account_name:
+            continue
+        now_iso = datetime.utcnow().isoformat()
+        print(f"{datetime.now()} [{account_name}] snapshot...")
+        mail_types = load_account_mail_types(acc)
+        entries = mail_types.get("entries", {})
+        enabled_keys = {k for k in mail_types.get("enabled", set()) if entries.get(k)}
+        folder_sources = defaultdict(set)
+        folder_decisions = {}
+        delete_fallback = None
+        for key in enabled_keys:
+            entry = entries.get(key) or {}
+            sources = _resolve_entry_folders(acc, entry)
+            for folder in sources:
+                if not folder:
+                    continue
+                canon = canonical_folder_name(folder)
+                if canon:
+                    folder_sources[folder].add(key)
+                    folder_decisions[canon] = key
+            if not delete_fallback and key and key.upper() in delete_pref_keys:
+                delete_fallback = key
+        archive_roots = _collect_archive_roots(acc)
+        imap = acc["imap"]
+        pwd = Path(imap["password_file"]).read_text().strip()
+        watch_folders = {"INBOX"}
+        for folder in folder_sources:
+            watch_folders.add(folder)
+        seen = set()
         with IMAPClient(imap["host"], port=imap["port"], ssl=imap["ssl"]) as srv:
             srv.login(imap["user"], pwd)
-            srv.select_folder("INBOX")
-            uids = srv.search()
-            for uid, data in srv.fetch(uids, ["BODY[]","ENVELOPE"]).items():
-                msgid = data[b"ENVELOPE"].message_id.decode() if data[b"ENVELOPE"].message_id else str(uid)
-                subject = data[b"ENVELOPE"].subject.decode() if data[b"ENVELOPE"].subject else ""
-                body = ""
+            for folder in sorted(watch_folders):
                 try:
-                    mp = parse_from_bytes(data[b"BODY[]"])
-                    body = mp.text_plain[0] if mp.text_plain else (mp.body or "")
-                except Exception: pass
-                cur.execute("INSERT OR IGNORE INTO mails (account,msgid,subject,body,folder,date) VALUES (?,?,?,?,?,?)",
-                    (acc["name"], msgid, clean_text(subject), clean_text(body), "INBOX", datetime.now().isoformat()))
+                    srv.select_folder(folder, readonly=True)
+                except Exception as exc:
+                    print(f"[WARN] {account_name} select {folder}: {exc}")
+                    continue
+                try:
+                    uids = srv.search()
+                except Exception as exc:
+                    print(f"[WARN] {account_name} search {folder}: {exc}")
+                    continue
+                if not uids:
+                    continue
+                try:
+                    fetched = srv.fetch(uids, ["BODY.PEEK[]", "ENVELOPE"])
+                except Exception as exc:
+                    print(f"[WARN] {account_name} fetch {folder}: {exc}")
+                    continue
+                for uid, data in fetched.items():
+                    env = data.get(b"ENVELOPE")
+                    msgid = None
+                    subject = ""
+                    if env:
+                        if env.message_id:
+                            try:
+                                msgid = env.message_id.decode()
+                            except Exception:
+                                msgid = str(env.message_id)
+                        if env.subject:
+                            try:
+                                subject = env.subject.decode()
+                            except Exception:
+                                subject = str(env.subject)
+                    if not msgid:
+                        msgid = f"{folder}:{uid}"
+                    body = ""
+                    raw_body = data.get(b"BODY[]") or data.get(b"BODY.PEEK[]")
+                    try:
+                        if raw_body:
+                            mp = parse_from_bytes(raw_body)
+                            body = mp.text_plain[0] if mp.text_plain else (mp.body or "")
+                    except Exception:
+                        pass
+                    body = clean_text(body)
+                    subject = clean_text(subject)
+                    canon_folder = canonical_folder_name(folder)
+                    decision_for_folder = folder_decisions.get(canon_folder)
+                    archive_hit = _is_archive_folder(folder, archive_roots)
+                    seen.add((account_name, msgid))
+                    cur.execute(
+                        "SELECT id, folder, decision, auto_moved FROM mails WHERE account=? AND msgid=?",
+                        (account_name, msgid),
+                    )
+                    row = cur.fetchone()
+                    updates = []
+                    params = []
+                    if row:
+                        row_id, prev_folder, prev_decision, prev_auto = row
+                        if prev_folder != folder:
+                            updates.append("folder=?")
+                            params.append(folder)
+                            updates.append("imap_uid=?")
+                            params.append(str(uid))
+                            updates.append("last_seen_at=?")
+                            params.append(now_iso)
+                            if prev_auto:
+                                updates.append("auto_moved=0")
+                                updates.append("auto_moved_at=NULL")
+                        else:
+                            updates.append("last_seen_at=?")
+                            params.append(now_iso)
+                            updates.append("imap_uid=?")
+                            params.append(str(uid))
+                        if subject:
+                            updates.append("subject=?")
+                            params.append(subject)
+                        if body:
+                            updates.append("body=?")
+                            params.append(body)
+                        if not archive_hit:
+                            if decision_for_folder:
+                                if prev_decision != decision_for_folder:
+                                    updates.append("decision=?")
+                                    params.append(decision_for_folder)
+                                    updates.append("confidence=?")
+                                    params.append(1.0)
+                                    updates.append("auto_moved=0")
+                                    updates.append("auto_moved_at=?")
+                                    params.append(None)
+                            elif prev_decision is not None and canon_folder == "INBOX":
+                                updates.append("decision=NULL")
+                                updates.append("confidence=NULL")
+                                updates.append("auto_moved=0")
+                                updates.append("auto_moved_at=NULL")
+                        if updates:
+                            set_clause = ",".join(updates)
+                            cur.execute(f"UPDATE mails SET {set_clause} WHERE id=?", (*params, row_id))
+                    else:
+                        cur.execute(
+                            "INSERT INTO mails (account,msgid,subject,body,folder,date,decision,confidence,imap_uid,last_seen_at,auto_moved) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            (
+                                account_name,
+                                msgid,
+                                subject,
+                                body,
+                                folder,
+                                now_iso,
+                                decision_for_folder if decision_for_folder and not archive_hit else None,
+                                1.0 if decision_for_folder and not archive_hit else None,
+                                str(uid),
+                                now_iso,
+                                0,
+                            ),
+                        )
+        if delete_fallback and seen:
+            cur.execute(
+                "SELECT id, msgid, folder FROM mails WHERE account=? AND folder='INBOX'",
+                (account_name,),
+            )
+            for row_id, msgid, folder in cur.fetchall():
+                if (account_name, msgid) in seen:
+                    continue
+                cur.execute(
+                    "UPDATE mails SET folder=?, decision=?, confidence=?, imap_uid=NULL, last_seen_at=?, auto_moved=0 WHERE id=?",
+                    (
+                        "__deleted__",
+                        delete_fallback,
+                        1.0,
+                        now_iso,
+                        row_id,
+                    ),
+                )
     conn.commit(); conn.close()
 
 def retrain(cfg):
@@ -101,7 +325,7 @@ def retrain(cfg):
     rows = cur.fetchall()
     if not rows:
         print("[WARN] no labeled data"); return
-    X = [clean_text(r[0]+" "+r[1]) for r in rows]
+    X = [clean_text(f"{(r[0] or '').strip()} {(r[1] or '').strip()}") for r in rows]
     y = [r[2] for r in rows]
     enc_name = cfg["model"]["encoder"]
     print(f"[train] loading encoder {enc_name} ...")
@@ -123,67 +347,187 @@ def predict(cfg, auto_move=False):
         encoder = joblib.load(MODEL_DIR/"encoder.joblib")
     except Exception:
         print("[predict] no model, run retrain first"); return
-    cur.execute("SELECT id,subject,body,account FROM mails WHERE decision IS NULL")
+    cur.execute(
+        "SELECT id,subject,body,account,imap_uid FROM mails WHERE decision IS NULL AND (folder IS NULL OR UPPER(folder)='INBOX')"
+    )
     rows = cur.fetchall()
-    if not rows: return
-    X = [clean_text(r[1]+" "+r[2]) for r in rows]
+    if not rows:
+        conn.close(); return
+    X = [clean_text((r[1] or "")+" "+(r[2] or "")) for r in rows]
     Xv = vectorize(X, encoder)
     probs = clf.predict_proba(Xv)
     preds = clf.classes_[np.argmax(probs, axis=1)]
-    accounts_map = {a["name"]: a for a in cfg.get("accounts", [])}
+    accounts_map = {a["name"]: a for a in cfg.get("accounts", []) if a.get("name")}
     mail_types_cache = {}
     min_conf = float(cfg.get("model", {}).get("min_auto_move_confidence", 0.85))
 
-    for (id_,_,_,account),p,label in zip(rows,probs,preds):
-        conf = np.max(p)
+    moves_by_account = defaultdict(list)
+    for (row, p, label) in zip(rows, probs, preds):
+        id_, _, _, account, imap_uid = row
+        conf = float(np.max(p))
         decision = label
-        cur.execute("UPDATE mails SET decision=?,confidence=? WHERE id=?",(decision,float(conf),id_))
         acc = accounts_map.get(account)
         mail_types = mail_types_cache.get(account)
         if mail_types is None:
             mail_types = load_account_mail_types(acc)
             mail_types_cache[account] = mail_types
-
         entries = mail_types.get("entries", {}) if mail_types else {}
         enabled = mail_types.get("enabled", set()) if mail_types else set()
-        entry = entries.get(decision)
-
+        entry = entries.get(decision) if entries else None
+        target = None
+        if entry:
+            target = entry.get("target_folder") or (acc or {}).get("folders", {}).get("targets", {}).get(decision)
+        elif acc:
+            target = acc.get("folders", {}).get("targets", {}).get(decision)
         log_msg = f"[predict] {account} -> {decision} ({conf:.2f})"
+        if not enabled:
+            print(log_msg + " [aucune règle active]")
+            continue
         if enabled and decision not in enabled:
             print(log_msg + " [désactivé dans config]")
             continue
         if entry and not entry.get("enabled", True):
             print(log_msg + " [règle désactivée]")
             continue
-
+        if not target:
+            print(log_msg + " [pas de dossier cible]")
+            continue
         print(log_msg)
-
+        cur.execute(
+            "UPDATE mails SET confidence=? WHERE id=?",
+            (conf, id_),
+        )
         if not (auto_move and acc and acc.get("mode", {}).get("auto_move", False) and conf > min_conf):
             continue
-
-        imap = acc["imap"]; pwd = Path(imap["password_file"]).read_text().strip()
-        target = None
-        if entry:
-            target = entry.get("target_folder") or acc.get("folders", {}).get("targets", {}).get(decision)
-        else:
-            target = acc.get("folders", {}).get("targets", {}).get(decision)
-
-        if not target:
+        if imap_uid is None:
+            print(f"[WARN] missing UID for {account} message {id_}, skip move")
             continue
+        try:
+            uid_int = int(imap_uid)
+        except Exception:
+            print(f"[WARN] invalid UID '{imap_uid}' for {account}, skip move")
+            continue
+        moves_by_account[account].append((id_, uid_int, decision, target, conf))
 
+    for account, items in moves_by_account.items():
+        acc = accounts_map.get(account)
+        if not acc:
+            continue
+        imap = acc.get("imap", {})
+        if not imap:
+            continue
+        pwd = Path(imap["password_file"]).read_text().strip()
         with IMAPClient(imap["host"], port=imap["port"], ssl=imap["ssl"]) as srv:
             srv.login(imap["user"], pwd)
-            try:
-                srv.move([id_], target)
-            except Exception as e:
-                print(f"[move] {e}")
+            srv.select_folder("INBOX")
+            for row_id, uid, decision, target, conf in items:
+                try:
+                    srv.move([uid], target)
+                except Exception as exc:
+                    print(f"[move] {account} uid={uid} -> {target}: {exc}")
+                    continue
+                now_iso = datetime.utcnow().isoformat()
+                cur.execute(
+                    "UPDATE mails SET folder=?, decision=?, auto_moved=1, auto_moved_at=?, imap_uid=NULL, confidence=? WHERE id=?",
+                    (target, decision, now_iso, conf, row_id),
+                )
     conn.commit(); conn.close()
+
+def stats(cfg):
+    conn = db_init(); cur = conn.cursor()
+    cur.execute(
+        """
+        SELECT account,
+               COUNT(*) AS total,
+               SUM(CASE WHEN decision IS NOT NULL THEN 1 ELSE 0 END) AS labeled
+        FROM mails
+        GROUP BY account
+        ORDER BY account
+        """
+    )
+    rows = cur.fetchall()
+    if not rows:
+        print("(no data in mails table)");
+        return
+
+    cur.execute(
+        """
+        SELECT account, decision, COUNT(*) AS cnt
+        FROM mails
+        WHERE decision IS NOT NULL
+        GROUP BY account, decision
+        """
+    )
+    decision_rows = cur.fetchall()
+    conn.close()
+    decisions_per_account = {}
+    for account, decision, count in decision_rows:
+        decisions_per_account.setdefault(account, {})[decision] = count
+
+    auto_move_map = {
+        a.get("name"): bool(a.get("mode", {}).get("auto_move", False))
+        for a in cfg.get("accounts", [])
+        if isinstance(a, dict) and a.get("name")
+    }
+    auto_summary = {
+        True: {"total": 0, "labeled": 0, "decisions": {}},
+        False: {"total": 0, "labeled": 0, "decisions": {}},
+    }
+
+    for account, total, labeled in rows:
+        labeled = labeled or 0
+        pending = (total or 0) - labeled
+        percent = (labeled / total * 100) if total else 0.0
+        auto_enabled = auto_move_map.get(account, False)
+        auto_summary[auto_enabled]["total"] += total or 0
+        auto_summary[auto_enabled]["labeled"] += labeled
+        decisions = decisions_per_account.get(account, {})
+        for decision, count in decisions.items():
+            auto_summary[auto_enabled]["decisions"][decision] = (
+                auto_summary[auto_enabled]["decisions"].get(decision, 0) + count
+            )
+
+        status = "enabled" if auto_enabled else "disabled"
+        print(f"Account '{account}' (auto-move {status})")
+        print(f"  Total messages : {total}")
+        print(f"  Labeled        : {labeled} ({percent:.1f}%)")
+        print(f"  Pending        : {pending}")
+        if decisions:
+            print("  Decisions      :")
+            for decision, count in sorted(decisions.items(), key=lambda kv: (-kv[1], kv[0] or "")):
+                label = decision if decision is not None else "<null>"
+                print(f"    - {label}: {count}")
+        else:
+            print("  Decisions      : (none)")
+        print()
+
+    print("Summary by auto-move status:")
+    for status_flag in (True, False):
+        status = "enabled" if status_flag else "disabled"
+        payload = auto_summary[status_flag]
+        total = payload["total"]
+        labeled = payload["labeled"]
+        pending = total - labeled
+        percent = (labeled / total * 100) if total else 0.0
+        print(f"- Auto-move {status}: total={total}, labeled={labeled} ({percent:.1f}%), pending={pending}")
+        decisions = payload["decisions"]
+        if decisions:
+            for decision, count in sorted(decisions.items(), key=lambda kv: (-kv[1], kv[0] or "")):
+                label = decision if decision is not None else "<null>"
+                print(f"    · {label}: {count}")
+        else:
+            print("    · (no labeled decisions)")
 
 def loop(cfg):
     every = int(cfg["scheduler"].get("poll_every_seconds",600))
+    retrain_every = int(cfg["scheduler"].get("retrain_every_seconds", 86400))
+    last_retrain = datetime.utcnow() - timedelta(seconds=retrain_every)
     while True:
         snapshot(cfg)
         predict(cfg, auto_move=True)
+        if (datetime.utcnow() - last_retrain).total_seconds() >= retrain_every:
+            retrain(cfg)
+            last_retrain = datetime.utcnow()
         time.sleep(every)
 
 # === CLI ===
@@ -195,6 +539,7 @@ if __name__=="__main__":
     if cmd=="snapshot": snapshot(cfg)
     elif cmd=="retrain": retrain(cfg)
     elif cmd=="predict": predict(cfg, auto_move="--auto" in sys.argv)
+    elif cmd=="stats": stats(cfg)
     elif cmd=="loop": loop(cfg)
     else:
         print("Unknown command",cmd); sys.exit(1)

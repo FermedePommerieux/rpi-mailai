@@ -59,11 +59,33 @@ Sample content created by `accountctl`:
 
 Toggle `enabled` to activate/deactivate a rule, adjust `target_folder`, and customise the French “prompt” to describe how the sorter should recognise the type. Generic prompts are provided for common categories (important, newsletters, projects, faible priorité, quarantaine, factures) and auto-move only occurs for enabled rules.
 
+Add an optional `source_folders` array when you want to learn from several mailboxes (e.g. both `INBOX/Spam` and `INBOX/Trash`). When omitted, the target folder is used as the single learning source. During each snapshot the assistant:
+
+- scans the INBOX for new mails but only auto-moves those messages once a model is confident;
+- revisits every enabled rule folder listed in `source_folders` to build the training set from the current content;
+- ignores corrections that land in archive folders (any folder containing “archive”, or those declared under `folders.archive*` in the account config);
+- records deletions as negative feedback for spam/promotions when a matching rule is enabled.
+
+If no rule is enabled for an account, the assistant simply observes the INBOX and does not attempt to classify or move any mail.
+
 ## Manual pipeline:
 ```bash
 docker exec -it rpi-mailai python /app/mailai.py --config /config/config.yml snapshot
 docker exec -it rpi-mailai python /app/mailai.py --config /config/config.yml predict
 ```
+
+The `loop` command now refreshes the snapshot, applies predictions restricted to the INBOX, and triggers a retraining pass at least once every 24 hours to incorporate user corrections (moves, deletions) automatically.
+
+## Inspect database stats
+
+Aggregate ingestion metrics (total mails, labeled share and decision distribution) per account directly from SQLite:
+
+```bash
+docker exec -it rpi-mailai python /app/mailai.py --config /config/config.yml stats
+```
+
+The command prints a per-account summary, highlights whether auto-move is enabled in the configuration, and provides totals by auto-move status.
+
 ## Heavier models
 ```bash
 sed -i 's/enable_cross_encoder: false/enable_cross_encoder: true/' config/config.yml
