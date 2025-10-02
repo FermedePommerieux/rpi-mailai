@@ -6,7 +6,7 @@ RPi-MailAI is a self-hosted IMAP triage service designed to run as a single Dock
 ## Functional Flow
 1. **Container lifecycle** – Docker builds install IMAP and ML dependencies and pre-download the default MiniLM encoder. At runtime the entrypoint ensures configuration and data directories exist, then calls `python /app/mailai.py --config ... loop` in a perpetual loop, interleaving nightly retrain jobs.
 2. **Account provisioning** – `accountctl` normalizes folder names according to the IMAP server's namespace, persists credentials, and augments the YAML config with account metadata used by the main app.
-3. **Message ingestion** – `snapshot` logs into each account, enumerates every UID returned by `srv.search()`, fetches full message bodies, parses them with `mailparser`, and records subjects and plain-text bodies into SQLite with a uniqueness constraint on `(account,msgid)`.
+3. **Message ingestion** – `snapshot` logs into each account, enumerates every UID returned by `srv.search()`, fetches full message bodies, parses them with `mailparser`, and records subjects and plain-text bodies into SQLite while storing a salted SHA-256 of each identifier to enforce a uniqueness constraint on `(account,msgid)`.
 4. **Model training** – `retrain` loads all labeled rows, derives embeddings through the configured `SentenceTransformer`, trains `LogisticRegression`, and saves both model and encoder via `joblib` to `/data/models` while recording metadata in the `models` table.
 5. **Prediction & actions** – `predict` reloads the persisted encoder and classifier, produces probabilities for unlabeled records, writes predictions back into SQLite, and, when `auto_move` is enabled, attempts to move messages to target folders via IMAP.
 

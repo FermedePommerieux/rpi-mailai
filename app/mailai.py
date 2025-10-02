@@ -18,7 +18,7 @@ faciliter l'onboarding ou le debug futur.
 """
 
 import json
-import os, sys, time, yaml, sqlite3, email, re, random
+import os, sys, time, yaml, sqlite3, email, re, random, hashlib
 from collections import defaultdict
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -28,6 +28,10 @@ from sentence_transformers import SentenceTransformer, CrossEncoder
 from sklearn.linear_model import LogisticRegression
 import joblib
 import numpy as np
+
+# Cache process-local pour éviter de recharger plusieurs fois l'encodeur dans
+# une même exécution (notamment pour snapshot/maintenance).
+_ENCODER_CACHE = {}
 
 # === CONFIG PATHS ===
 CFG_PATH = Path(os.environ.get("APP_CONFIG", "/config/config.yml"))
@@ -59,7 +63,32 @@ def load_cfg():
     with open(CFG_PATH, "r") as f:
         return yaml.safe_load(f)
 
-def db_init():
+def _looks_like_hash(value):
+    """Détecte si une chaîne ressemble à un hash hexadécimal SHA-256."""
+
+    if not value or not isinstance(value, str):
+        return False
+    return bool(re.fullmatch(r"[0-9a-f]{64}", value))
+
+
+def compute_mail_key(account, raw_identifier, salt):
+    """Retourne un identifiant anonymisé stable pour un email."""
+
+    account = account or ""
+    raw_identifier = raw_identifier or ""
+    if isinstance(salt, bytes):
+        salt_bytes = salt
+    else:
+        salt_bytes = str(salt or "").encode("utf-8")
+    payload = f"{account}\0{raw_identifier}".encode("utf-8", "ignore")
+    hasher = hashlib.sha256()
+    if salt_bytes:
+        hasher.update(salt_bytes)
+    hasher.update(payload)
+    return hasher.hexdigest()
+
+
+def db_init(cfg=None):
     """Prépare la base SQLite et effectue les migrations minimales.
 
     On crée les tables nécessaires si elles n'existent pas encore puis on
@@ -71,6 +100,8 @@ def db_init():
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+    cfg = cfg if isinstance(cfg, dict) else {}
+    hash_salt = str(cfg.get("hash_salt") or "")
 
     # Table principale : un enregistrement par email unique (compte + Message-ID).
     c.execute(
@@ -96,6 +127,41 @@ def db_init():
         c.execute("ALTER TABLE mails ADD COLUMN auto_moved INTEGER DEFAULT 0")
     if "auto_moved_at" not in cols:
         c.execute("ALTER TABLE mails ADD COLUMN auto_moved_at TEXT")
+    if "embedding" not in cols:
+        c.execute("ALTER TABLE mails ADD COLUMN embedding BLOB")
+    if "embedding_dim" not in cols:
+        c.execute("ALTER TABLE mails ADD COLUMN embedding_dim INTEGER")
+    if "embedding_encoder" not in cols:
+        c.execute("ALTER TABLE mails ADD COLUMN embedding_encoder TEXT")
+
+    # Purge automatique du texte lorsque l'embedding est présent afin de
+    # limiter l'exposition des données sensibles dans la base.
+    c.execute(
+        "UPDATE mails SET subject=NULL, body=NULL "
+        "WHERE embedding IS NOT NULL AND (subject IS NOT NULL OR body IS NOT NULL)"
+    )
+
+    # Migration : anonymisation des identifiants de messages via hash salé.
+    c.execute(
+        "SELECT id, account, msgid FROM mails "
+        "WHERE msgid IS NOT NULL AND (LENGTH(msgid) != 64 OR msgid GLOB '*[^0-9a-f]*')"
+    )
+    updates = []
+    for row_id, account, msgid in c.fetchall():
+        if msgid is None:
+            continue
+        if _looks_like_hash(msgid):
+            continue
+        anon = compute_mail_key(account, msgid, hash_salt)
+        if anon != msgid:
+            updates.append((anon, row_id))
+    if updates:
+        c.executemany("UPDATE mails SET msgid=? WHERE id=?", updates)
+
+    # S'assure qu'un index unique explicite existe sur (account, msgid).
+    c.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_mails_account_msgid ON mails(account, msgid)"
+    )
 
     # Table pour suivre l'historique des entraînements réalisés.
     c.execute(
@@ -119,8 +185,31 @@ def clean_text(s):
 def vectorize(texts, encoder):
     """Applique l'encodeur SentenceTransformer et renvoie une matrice numpy."""
 
+    if not texts:
+        return np.zeros((0, 0), dtype=np.float32)
     emb = encoder.encode(texts, show_progress_bar=False)
-    return np.array(emb)
+    return np.asarray(emb, dtype=np.float32)
+
+
+def get_encoder(enc_name):
+    """Charge et met en cache un encodeur SentenceTransformer."""
+
+    encoder = _ENCODER_CACHE.get(enc_name)
+    if encoder is None:
+        print(f"[encoder] loading {enc_name} ...")
+        encoder = SentenceTransformer(enc_name)
+        _ENCODER_CACHE[enc_name] = encoder
+    return encoder
+
+
+def compute_embedding_bytes(text, encoder):
+    """Encode un texte et renvoie le couple (bytes, dimension)."""
+
+    vec = vectorize([text], encoder)
+    if vec.size == 0:
+        return None, None
+    arr = vec[0]
+    return arr.tobytes(), int(arr.shape[0])
 
 
 def canonical_folder_name(name: str) -> str:
@@ -236,12 +325,19 @@ def snapshot(cfg):
     décisions prises manuellement par l'utilisateur afin d'alimenter l'apprentissage.
     """
 
-    conn = db_init()
+    conn = db_init(cfg)
     cur = conn.cursor()
 
     # Ces valeurs servent de fallback si un message disparaît d'INBOX : on les
     # utilise pour marquer les mails comme supprimés / spam automatiquement.
     delete_pref_keys = {"SPAM", "INDESIRABLE", "JUNK", "PROMOTION", "PROMOTIONS", "NEWSLETTER"}
+
+    model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
+    enc_name = model_cfg.get("encoder")
+    encoder_available = bool(enc_name)
+    encoder = None
+
+    hash_salt = str(cfg.get("hash_salt") or "")
 
     for acc in cfg.get("accounts", []):
         account_name = acc.get("name")
@@ -314,23 +410,23 @@ def snapshot(cfg):
 
                 for uid, data in fetched.items():
                     env = data.get(b"ENVELOPE")
-                    msgid = None
+                    raw_identifier = None
                     subject = ""
                     if env:
                         if env.message_id:
                             try:
-                                msgid = env.message_id.decode()
+                                raw_identifier = env.message_id.decode()
                             except Exception:
-                                msgid = str(env.message_id)
+                                raw_identifier = str(env.message_id)
                         if env.subject:
                             try:
                                 subject = env.subject.decode()
                             except Exception:
                                 subject = str(env.subject)
-                    if not msgid:
+                    if not raw_identifier:
                         # Fallback: on compose un identifiant stable basé sur
                         # le dossier et l'UID IMAP.
-                        msgid = f"{folder}:{uid}"
+                        raw_identifier = f"{folder}:{uid}"
 
                     body = ""
                     raw_body = data.get(b"BODY[]") or data.get(b"BODY.PEEK[]")
@@ -346,23 +442,37 @@ def snapshot(cfg):
                     # énormes et mal normalisées dans la base.
                     body = clean_text(body)
                     subject = clean_text(subject)
+                    combined_text = clean_text(f"{subject} {body}")
 
                     canon_folder = canonical_folder_name(folder)
                     decision_for_folder = folder_decisions.get(canon_folder)
                     archive_hit = _is_archive_folder(folder, archive_roots)
 
                     # Trace que le message a été vu durant ce snapshot.
-                    seen.add((account_name, msgid))
+                    mail_key = compute_mail_key(account_name, raw_identifier, hash_salt)
+                    seen.add((account_name, mail_key))
 
                     cur.execute(
-                        "SELECT id, folder, decision, auto_moved FROM mails WHERE account=? AND msgid=?",
-                        (account_name, msgid),
+                        "SELECT id, folder, decision, auto_moved, embedding, embedding_encoder, embedding_dim "
+                        "FROM mails WHERE account=? AND msgid=?",
+                        (account_name, mail_key),
                     )
                     row = cur.fetchone()
                     updates = []
                     params = []
+                    embedding_blob = None
+                    embedding_dim = None
                     if row:
-                        row_id, prev_folder, prev_decision, prev_auto = row
+                        (
+                            row_id,
+                            prev_folder,
+                            prev_decision,
+                            prev_auto,
+                            prev_embedding,
+                            prev_encoder,
+                            prev_dim,
+                        ) = row
+                        needs_embedding = False
                         if prev_folder != folder:
                             # Déplacement détecté -> on met à jour dossier, UID et timestamps.
                             updates.append("folder=?")
@@ -382,12 +492,12 @@ def snapshot(cfg):
                             params.append(now_iso)
                             updates.append("imap_uid=?")
                             params.append(str(uid))
-                        if subject:
-                            updates.append("subject=?")
-                            params.append(subject)
-                        if body:
-                            updates.append("body=?")
-                            params.append(body)
+                        if encoder_available and (
+                            prev_embedding is None
+                            or not prev_dim
+                            or prev_encoder != enc_name
+                        ):
+                            needs_embedding = True
                         if not archive_hit:
                             if decision_for_folder:
                                 if prev_decision != decision_for_folder:
@@ -406,19 +516,60 @@ def snapshot(cfg):
                                 updates.append("confidence=NULL")
                                 updates.append("auto_moved=0")
                                 updates.append("auto_moved_at=NULL")
+                        if needs_embedding:
+                            if encoder is None:
+                                encoder = get_encoder(enc_name)
+                            emb_bytes, emb_dim = compute_embedding_bytes(combined_text, encoder)
+                            if emb_bytes is not None:
+                                embedding_blob = sqlite3.Binary(emb_bytes)
+                                embedding_dim = emb_dim
+                            else:
+                                print(
+                                    f"[WARN] unable to compute embedding for {account_name} {mail_key}"
+                                )
+                        if embedding_blob is not None:
+                            updates.append("embedding=?")
+                            params.append(embedding_blob)
+                            updates.append("embedding_dim=?")
+                            params.append(embedding_dim)
+                            updates.append("embedding_encoder=?")
+                            params.append(enc_name)
+                            updates.append("subject=NULL")
+                            updates.append("body=NULL")
+                        elif not encoder_available:
+                            if subject:
+                                updates.append("subject=?")
+                                params.append(subject)
+                            if body:
+                                updates.append("body=?")
+                                params.append(body)
                         if updates:
                             set_clause = ",".join(updates)
                             cur.execute(f"UPDATE mails SET {set_clause} WHERE id=?", (*params, row_id))
                     else:
+                        if encoder_available:
+                            if encoder is None:
+                                encoder = get_encoder(enc_name)
+                            emb_bytes, emb_dim = compute_embedding_bytes(combined_text, encoder)
+                            if emb_bytes is not None:
+                                embedding_blob = sqlite3.Binary(emb_bytes)
+                                embedding_dim = emb_dim
+                            else:
+                                print(f"[WARN] unable to compute embedding for {account_name} {mail_key}")
+                        subject_value = None
+                        body_value = None
+                        if embedding_blob is None:
+                            subject_value = subject
+                            body_value = body
                         # Nouveau message : on insère une ligne complète avec les métadonnées courantes.
                         cur.execute(
-                            "INSERT INTO mails (account,msgid,subject,body,folder,date,decision,confidence,imap_uid,last_seen_at,auto_moved) "
-                            "VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                            "INSERT INTO mails (account,msgid,subject,body,folder,date,decision,confidence,imap_uid,last_seen_at,auto_moved,embedding,embedding_dim,embedding_encoder) "
+                            "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                             (
                                 account_name,
-                                msgid,
-                                subject,
-                                body,
+                                mail_key,
+                                subject_value,
+                                body_value,
                                 folder,
                                 now_iso,
                                 decision_for_folder if decision_for_folder and not archive_hit else None,
@@ -426,6 +577,9 @@ def snapshot(cfg):
                                 str(uid),
                                 now_iso,
                                 0,
+                                embedding_blob,
+                                embedding_dim,
+                                enc_name if embedding_blob is not None else None,
                             ),
                         )
 
@@ -437,8 +591,8 @@ def snapshot(cfg):
                 "SELECT id, msgid, folder FROM mails WHERE account=? AND folder='INBOX'",
                 (account_name,),
             )
-            for row_id, msgid, folder in cur.fetchall():
-                if (account_name, msgid) in seen:
+            for row_id, mail_key_db, folder in cur.fetchall():
+                if (account_name, mail_key_db) in seen:
                     continue
                 cur.execute(
                     "UPDATE mails SET folder=?, decision=?, confidence=?, imap_uid=NULL, last_seen_at=?, auto_moved=0 WHERE id=?",
@@ -457,24 +611,82 @@ def snapshot(cfg):
 def retrain(cfg):
     """Réentraîne le modèle de classification à partir des données étiquetées."""
 
-    conn = db_init()
+    conn = db_init(cfg)
     cur = conn.cursor()
-    cur.execute("SELECT subject,body,decision FROM mails WHERE decision IS NOT NULL")
+    cur.execute(
+        "SELECT id, embedding, embedding_dim, embedding_encoder, subject, body, decision "
+        "FROM mails WHERE decision IS NOT NULL"
+    )
     rows = cur.fetchall()
     if not rows:
         print("[WARN] no labeled data")
         return
 
-    # Préparation des features texte (concat sujet + corps) avec nettoyage.
-    X = [clean_text(f"{(r[0] or '').strip()} {(r[1] or '').strip()}") for r in rows]
-    y = [r[2] for r in rows]
+    enc_name = (cfg.get("model") or {}).get("encoder")
+    if not enc_name:
+        print("[ERROR] missing encoder configuration")
+        return
 
-    enc_name = cfg["model"]["encoder"]
-    print(f"[train] loading encoder {enc_name} ...")
-    encoder = SentenceTransformer(enc_name)
+    encoder = get_encoder(enc_name)
 
-    # Passage dans l'encodeur SentenceTransformer pour obtenir des embeddings.
-    Xv = vectorize(X, encoder)
+    vectors = []
+    labels = []
+    missing_rows = []
+    for row in rows:
+        (
+            row_id,
+            emb_bytes,
+            emb_dim,
+            emb_encoder,
+            subject,
+            body,
+            decision,
+        ) = row
+        vector = None
+        if emb_bytes and emb_dim and emb_encoder == enc_name:
+            arr = np.frombuffer(emb_bytes, dtype=np.float32)
+            if arr.size == emb_dim:
+                vector = arr
+        if vector is None:
+            text = clean_text(f"{(subject or '').strip()} {(body or '').strip()}")
+            if text:
+                missing_rows.append((row_id, text, decision))
+            else:
+                print(f"[WARN] skip id={row_id}: no embedding and empty text")
+            continue
+        vectors.append(vector)
+        labels.append(decision)
+
+    if missing_rows:
+        texts = [item[1] for item in missing_rows]
+        encoded = vectorize(texts, encoder)
+        for (row_id, _text, decision), vec in zip(missing_rows, encoded):
+            if vec.size == 0:
+                print(f"[WARN] skip id={row_id}: unable to encode text")
+                continue
+            arr = np.asarray(vec, dtype=np.float32)
+            vectors.append(arr)
+            labels.append(decision)
+            cur.execute(
+                "UPDATE mails SET embedding=?, embedding_dim=?, embedding_encoder=?, subject=NULL, body=NULL WHERE id=?",
+                (
+                    sqlite3.Binary(arr.tobytes()),
+                    int(arr.shape[0]),
+                    enc_name,
+                    row_id,
+                ),
+            )
+
+    if not vectors:
+        print("[WARN] no usable embeddings for training")
+        conn.commit()
+        conn.close()
+        return
+
+    # Empilement des embeddings et conversion vers float64 pour sklearn.
+    Xv = np.vstack(vectors).astype(np.float64)
+    y = labels
+
     clf = LogisticRegression(max_iter=1000)
     clf.fit(Xv, y)
 
@@ -493,7 +705,7 @@ def retrain(cfg):
 def predict(cfg, auto_move=False):
     """Effectue des prédictions sur les emails en attente et optionnellement les déplace."""
 
-    conn = db_init()
+    conn = db_init(cfg)
     cur = conn.cursor()
     try:
         clf = joblib.load(MODEL_DIR / "clf.joblib")
@@ -503,16 +715,69 @@ def predict(cfg, auto_move=False):
         return
 
     cur.execute(
-        "SELECT id,subject,body,account,imap_uid FROM mails WHERE decision IS NULL AND (folder IS NULL OR UPPER(folder)='INBOX')"
+        "SELECT id, embedding, embedding_dim, embedding_encoder, subject, body, account, imap_uid "
+        "FROM mails WHERE decision IS NULL AND (folder IS NULL OR UPPER(folder)='INBOX')"
     )
     rows = cur.fetchall()
     if not rows:
         conn.close()
         return
 
-    # Conversion en embeddings pour le modèle.
-    X = [clean_text((r[1] or "") + " " + (r[2] or "")) for r in rows]
-    Xv = vectorize(X, encoder)
+    enc_name = (cfg.get("model") or {}).get("encoder")
+    expected_dim = clf.coef_.shape[1]
+
+    prepared_rows = []
+    vectors = []
+    for row in rows:
+        (
+            row_id,
+            emb_bytes,
+            emb_dim,
+            emb_encoder,
+            subject,
+            body,
+            account,
+            imap_uid,
+        ) = row
+        vector = None
+        if (
+            emb_bytes
+            and emb_dim
+            and emb_dim == expected_dim
+            and (enc_name is None or emb_encoder == enc_name)
+        ):
+            arr = np.frombuffer(emb_bytes, dtype=np.float32)
+            if arr.size == expected_dim:
+                vector = arr
+        if vector is None:
+            text = clean_text(f"{(subject or '').strip()} {(body or '').strip()}")
+            if not text:
+                print(f"[predict] skip id={row_id}: missing embedding and text")
+                continue
+            vec = vectorize([text], encoder)
+            if vec.size == 0:
+                print(f"[predict] skip id={row_id}: encoder returned empty vector")
+                continue
+            arr = np.asarray(vec[0], dtype=np.float32)
+            vector = arr
+            cur.execute(
+                "UPDATE mails SET embedding=?, embedding_dim=?, embedding_encoder=?, subject=NULL, body=NULL WHERE id=?",
+                (
+                    sqlite3.Binary(arr.tobytes()),
+                    int(arr.shape[0]),
+                    enc_name or emb_encoder,
+                    row_id,
+                ),
+            )
+        prepared_rows.append((row_id, account, imap_uid))
+        vectors.append(vector)
+
+    if not vectors:
+        conn.commit()
+        conn.close()
+        return
+
+    Xv = np.vstack(vectors).astype(np.float64)
     probs = clf.predict_proba(Xv)
     preds = clf.classes_[np.argmax(probs, axis=1)]
 
@@ -521,8 +786,8 @@ def predict(cfg, auto_move=False):
     min_conf = float(cfg.get("model", {}).get("min_auto_move_confidence", 0.85))
 
     moves_by_account = defaultdict(list)
-    for (row, p, label) in zip(rows, probs, preds):
-        id_, _, _, account, imap_uid = row
+    for (row_meta, p, label) in zip(prepared_rows, probs, preds):
+        id_, account, imap_uid = row_meta
         conf = float(np.max(p))
         decision = label
         acc = accounts_map.get(account)
@@ -602,10 +867,94 @@ def predict(cfg, auto_move=False):
     conn.commit()
     conn.close()
 
+def migrate_embeddings(cfg):
+    """Maintenance : recalcule les embeddings manquants et purge le texte brut."""
+
+    conn = db_init(cfg)
+    cur = conn.cursor()
+    enc_name = (cfg.get("model") or {}).get("encoder")
+    if not enc_name:
+        print("[ERROR] missing encoder configuration")
+        return
+
+    encoder = get_encoder(enc_name)
+    cur.execute(
+        "SELECT id, subject, body, embedding, embedding_dim, embedding_encoder FROM mails"
+    )
+    rows = cur.fetchall()
+    if not rows:
+        print("[migrate] no data in mails table")
+        return
+
+    to_encode = []
+    purge_ids = set()
+    skipped = 0
+    updated = 0
+
+    for row in rows:
+        (
+            row_id,
+            subject,
+            body,
+            emb_bytes,
+            emb_dim,
+            emb_encoder,
+        ) = row
+        text = clean_text(f"{(subject or '').strip()} {(body or '').strip()}")
+        vector_valid = False
+        if emb_bytes and emb_dim:
+            arr = np.frombuffer(emb_bytes, dtype=np.float32)
+            if arr.size == emb_dim and emb_encoder == enc_name:
+                vector_valid = True
+        if vector_valid:
+            if subject or body:
+                purge_ids.add(row_id)
+            continue
+        if text:
+            to_encode.append((row_id, text))
+        else:
+            skipped += 1
+
+    batch_size = 64
+    for idx in range(0, len(to_encode), batch_size):
+        batch = to_encode[idx : idx + batch_size]
+        texts = [item[1] for item in batch]
+        encoded = vectorize(texts, encoder)
+        for (row_id, _), vec in zip(batch, encoded):
+            if vec.size == 0:
+                skipped += 1
+                continue
+            arr = np.asarray(vec, dtype=np.float32)
+            cur.execute(
+                "UPDATE mails SET embedding=?, embedding_dim=?, embedding_encoder=?, subject=NULL, body=NULL WHERE id=?",
+                (
+                    sqlite3.Binary(arr.tobytes()),
+                    int(arr.shape[0]),
+                    enc_name,
+                    row_id,
+                ),
+            )
+            updated += 1
+
+    if purge_ids:
+        cur.executemany(
+            "UPDATE mails SET subject=NULL, body=NULL WHERE id=?",
+            [(row_id,) for row_id in purge_ids],
+        )
+
+    conn.commit()
+    conn.close()
+
+    print(f"[migrate] embeddings updated: {updated}")
+    if purge_ids:
+        print(f"[migrate] purged text for {len(purge_ids)} rows")
+    if skipped:
+        print(f"[migrate] skipped rows without data: {skipped}")
+
 def stats(cfg):
     """Affiche des statistiques de labeling par compte et par mode auto-move."""
 
-    conn = db_init()
+    conn = db_init(cfg)
     cur = conn.cursor()
     cur.execute(
         """
@@ -708,7 +1057,7 @@ def loop(cfg):
 # === CLI ===
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        print("Usage: mailai.py [snapshot|predict|retrain|loop] --config ...")
+        print("Usage: mailai.py [snapshot|predict|retrain|stats|migrate_embeddings|loop] [--auto] --config ...")
         sys.exit(1)
     cmd = sys.argv[1]
     cfg = load_cfg()
@@ -720,6 +1069,8 @@ if __name__ == "__main__":
         predict(cfg, auto_move="--auto" in sys.argv)
     elif cmd == "stats":
         stats(cfg)
+    elif cmd == "migrate_embeddings":
+        migrate_embeddings(cfg)
     elif cmd == "loop":
         loop(cfg)
     else:
