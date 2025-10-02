@@ -1,20 +1,19 @@
 #!/usr/bin/env python3
-"""MailAI: automatisation de la classification des emails.
+"""MailAI: automation for email classification.
 
-Ce script regroupe l'ensemble de la chaîne de traitement de l'application :
+This script orchestrates the entire processing pipeline of the application:
 
-* Initialisation/maintenance de la base SQLite qui stocke les emails vus et
-  leurs décisions associées.
-* Synchronisation des boîtes IMAP pour récupérer le contenu brut des
-  messages et garder une trace de leur dernière position côté serveur.
-* Entraînement et utilisation d'un modèle de classification (Sentence
-  Transformers + régression logistique) pour suggérer ou appliquer des règles
-  de tri automatique.
-* Outils de monitoring (statistiques) et de scheduling (boucle continue).
+* Initialization and maintenance of the SQLite database that stores processed
+  emails and their associated decisions.
+* Synchronization of IMAP mailboxes to fetch the raw message content and keep
+  track of their last server-side location.
+* Training and inference of a classification model (Sentence Transformers +
+  logistic regression) to suggest or apply automatic triage rules.
+* Monitoring and scheduling utilities (statistics plus the continuous loop).
 
-L'objectif de cette passe de documentation est de rendre le flot de
-traitement explicitement lisible : chaque étape est abondamment commentée pour
-faciliter l'onboarding ou le debug futur.
+The objective of this extensive documentation is to keep the processing flow
+explicit: every step is thoroughly commented to ease onboarding and future
+debugging sessions.
 """
 
 import json
@@ -29,8 +28,8 @@ from sklearn.linear_model import LogisticRegression
 import joblib
 import numpy as np
 
-# Cache process-local pour éviter de recharger plusieurs fois l'encodeur dans
-# une même exécution (notamment pour snapshot/maintenance).
+# Process-local cache to avoid reloading the encoder multiple times during the
+# same execution (especially for snapshot/maintenance runs).
 _ENCODER_CACHE = {}
 
 # === CONFIG PATHS ===
@@ -40,31 +39,31 @@ MAIL_TYPES_DIR = Path(os.environ.get("MAIL_TYPES_DIR", "/config/account_types"))
 DB_PATH = DATA_DIR / "db" / "mailai.sqlite"
 MODEL_DIR = DATA_DIR / "models"
 
-# L'entraînement et les prédictions nécessitent la présence d'un dossier pour
-# stocker les artefacts (modèles, encodeur). On crée donc le dossier dès le
-# chargement du module pour éviter les races lors d'exécutions parallèles.
+# Training and inference need a directory to store artefacts (models, encoder).
+# We therefore create it during module import time to avoid races in parallel
+# executions.
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
 # === HELPERS ===
 def load_cfg():
-    """Charge la configuration principale de l'application.
+    """Load the main configuration for the application.
 
-    La configuration YAML décrit entre autres les comptes IMAP à suivre, les
-    paramètres du modèle et la planification.
+    The YAML configuration describes, among other things, the IMAP accounts to
+    monitor, the model parameters, and the scheduling options.
     """
 
-    # On s'assure que le fichier est présent avant de tenter de le parser :
-    # sans configuration l'application ne peut pas fonctionner.
+    # Ensure the file is present before attempting to parse it: without a
+    # configuration the application cannot run at all.
     if not CFG_PATH.exists():
         print(f"[ERROR] config missing: {CFG_PATH}", file=sys.stderr)
         sys.exit(2)
 
-    # Chargement brut du YAML -> dictionnaire Python.
+    # Plain YAML loading into a Python dictionary.
     with open(CFG_PATH, "r") as f:
         return yaml.safe_load(f)
 
 def _looks_like_hash(value):
-    """Détecte si une chaîne ressemble à un hash hexadécimal SHA-256."""
+    """Detect whether a string looks like a hexadecimal SHA-256 hash."""
 
     if not value or not isinstance(value, str):
         return False
@@ -72,7 +71,7 @@ def _looks_like_hash(value):
 
 
 def compute_mail_key(account, raw_identifier, salt):
-    """Retourne un identifiant anonymisé stable pour un email."""
+    """Return a stable anonymised identifier for an email."""
 
     account = account or ""
     raw_identifier = raw_identifier or ""
@@ -89,21 +88,21 @@ def compute_mail_key(account, raw_identifier, salt):
 
 
 def db_init(cfg=None):
-    """Prépare la base SQLite et effectue les migrations minimales.
+    """Prepare the SQLite database and apply the minimal migrations.
 
-    On crée les tables nécessaires si elles n'existent pas encore puis on
-    applique quelques migrations simples (ajout de colonnes). La fonction
-    renvoie un handle `sqlite3.Connection` réutilisable par l'appelant.
+    The function creates the required tables if they do not exist yet and then
+    applies a few simple migrations (column additions). It returns a reusable
+    `sqlite3.Connection` handle to the caller.
     """
 
-    # Création du répertoire de travail si besoin avant d'ouvrir la base.
+    # Create the working directory if needed before opening the database.
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
     cfg = cfg if isinstance(cfg, dict) else {}
     hash_salt = str(cfg.get("hash_salt") or "")
 
-    # Table principale : un enregistrement par email unique (compte + Message-ID).
+    # Main table: one record per unique email (account + Message-ID).
     c.execute(
         """CREATE TABLE IF NOT EXISTS mails (
         id INTEGER PRIMARY KEY,
@@ -115,8 +114,8 @@ def db_init(cfg=None):
     )"""
     )
 
-    # --- migrations légères ---
-    # On inspecte la structure courante puis on ajoute les colonnes manquantes.
+    # --- light migrations ---
+    # Inspect the current schema and add missing columns on the fly.
     c.execute("PRAGMA table_info(mails)")
     cols = {row[1] for row in c.fetchall()}
     if "imap_uid" not in cols:
@@ -134,14 +133,14 @@ def db_init(cfg=None):
     if "embedding_encoder" not in cols:
         c.execute("ALTER TABLE mails ADD COLUMN embedding_encoder TEXT")
 
-    # Purge automatique du texte lorsque l'embedding est présent afin de
-    # limiter l'exposition des données sensibles dans la base.
+    # Automatically purge plain text when an embedding is available to limit
+    # the exposure of sensitive data in the database.
     c.execute(
         "UPDATE mails SET subject=NULL, body=NULL "
         "WHERE embedding IS NOT NULL AND (subject IS NOT NULL OR body IS NOT NULL)"
     )
 
-    # Migration : anonymisation des identifiants de messages via hash salé.
+    # Migration: anonymise message identifiers via a salted hash.
     c.execute(
         "SELECT id, account, msgid FROM mails "
         "WHERE msgid IS NOT NULL AND (LENGTH(msgid) != 64 OR msgid GLOB '*[^0-9a-f]*')"
@@ -158,12 +157,12 @@ def db_init(cfg=None):
     if updates:
         c.executemany("UPDATE mails SET msgid=? WHERE id=?", updates)
 
-    # S'assure qu'un index unique explicite existe sur (account, msgid).
+    # Ensure an explicit unique index exists on (account, msgid).
     c.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_mails_account_msgid ON mails(account, msgid)"
     )
 
-    # Table pour suivre l'historique des entraînements réalisés.
+    # Table that tracks the history of completed training runs.
     c.execute(
         """CREATE TABLE IF NOT EXISTS models (
         id INTEGER PRIMARY KEY, version TEXT, trained_at TEXT
@@ -174,16 +173,16 @@ def db_init(cfg=None):
     return conn
 
 def clean_text(s):
-    """Nettoie rapidement un texte pour l'encoder plus facilement."""
+    """Quickly clean a text snippet to make encoding easier."""
 
     if not s:
         return ""
 
-    # Suppression des espaces multiples et normalisation des sauts de ligne.
+    # Collapse repeated whitespace and normalise line breaks.
     return re.sub(r"\s+", " ", s).strip()
 
 def vectorize(texts, encoder):
-    """Applique l'encodeur SentenceTransformer et renvoie une matrice numpy."""
+    """Apply the SentenceTransformer encoder and return a numpy matrix."""
 
     if not texts:
         return np.zeros((0, 0), dtype=np.float32)
@@ -192,7 +191,7 @@ def vectorize(texts, encoder):
 
 
 def get_encoder(enc_name):
-    """Charge et met en cache un encodeur SentenceTransformer."""
+    """Load and cache a SentenceTransformer encoder."""
 
     encoder = _ENCODER_CACHE.get(enc_name)
     if encoder is None:
@@ -203,7 +202,7 @@ def get_encoder(enc_name):
 
 
 def compute_embedding_bytes(text, encoder):
-    """Encode un texte et renvoie le couple (bytes, dimension)."""
+    """Encode a text snippet and return the pair (bytes, dimension)."""
 
     vec = vectorize([text], encoder)
     if vec.size == 0:
@@ -213,7 +212,7 @@ def compute_embedding_bytes(text, encoder):
 
 
 def canonical_folder_name(name: str) -> str:
-    """Normalise le nom d'un dossier IMAP (majuscules, séparateur /)."""
+    """Normalise an IMAP folder name (upper case, `/` separator)."""
 
     if not name:
         return ""
@@ -226,13 +225,13 @@ def canonical_folder_name(name: str) -> str:
 
 
 def load_account_mail_types(acc):
-    """Charge les règles de typage personnalisées associées à un compte."""
+    """Load custom typing rules associated with an account."""
 
     if not acc:
         return {}
 
-    # On recherche d'abord un chemin défini explicitement dans la config du
-    # compte, sinon on tente un fallback basé sur le nom du compte.
+    # Look for an explicitly configured path first, otherwise fall back to the
+    # account name.
     cfg_path = acc.get("mail_types_config")
     if not cfg_path:
         default_path = MAIL_TYPES_DIR / f"{acc['name']}.json"
@@ -240,8 +239,8 @@ def load_account_mail_types(acc):
     if not cfg_path:
         return {}
 
-    # Lecture du fichier JSON qui décrit les règles. La robustesse est de mise
-    # car un fichier manquant ou mal formé ne doit pas faire planter la synchro.
+    # Read the JSON file describing the rules. Resilience is key because a
+    # missing or malformed file should not break the sync loop.
     try:
         with open(cfg_path, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
@@ -251,7 +250,7 @@ def load_account_mail_types(acc):
         print(f"[WARN] invalid mail types JSON for {acc['name']}: {exc}")
         return {}
 
-    # Indexation rapide par clé pour simplifier les lookups plus tard.
+    # Build a quick index keyed by rule identifier to simplify later lookups.
     entries = payload.get("types", [])
     index = {e.get("key"): e for e in entries if e.get("key")}
     enabled = {k for k, v in index.items() if v.get("enabled", True)}
@@ -259,7 +258,7 @@ def load_account_mail_types(acc):
 
 
 def _resolve_entry_folders(account_cfg, entry):
-    """Détermine les dossiers IMAP liés à une règle de typage donnée."""
+    """Determine the IMAP folders tied to a given typing rule."""
 
     folders = set()
     if not entry:
@@ -272,8 +271,8 @@ def _resolve_entry_folders(account_cfg, entry):
         if item:
             folders.add(item)
 
-    # Si la règle définit un dossier cible, on l'ajoute aussi pour surveiller
-    # les mouvements et détecter les classifications existantes.
+    # If the rule defines a target folder, include it to watch moves and detect
+    # existing classifications.
     target = entry.get("target_folder")
     if not target:
         target = account_cfg.get("folders", {}).get("targets", {}).get(entry.get("key"))
@@ -282,54 +281,102 @@ def _resolve_entry_folders(account_cfg, entry):
     return folders
 
 
-def _collect_archive_roots(account_cfg):
-    """Construit la liste des dossiers considérés comme archives."""
+def _normalise_flags(flags):
+    """Return a set of upper-case IMAP flags."""
 
-    roots = set()
-    folders_cfg = account_cfg.get("folders", {}) if account_cfg else {}
-    archive_values = []
-    for key in ("archive", "archives", "archive_root", "archive_roots"):
-        val = folders_cfg.get(key)
-        if isinstance(val, list):
-            archive_values.extend(val)
-        elif val:
-            archive_values.append(val)
-    for item in archive_values:
-        if item:
-            roots.add(canonical_folder_name(item))
-    return roots
+    normalised = set()
+    for flag in flags or ():
+        if isinstance(flag, bytes):
+            try:
+                flag = flag.decode("utf-8")
+            except Exception:
+                flag = str(flag)
+        if not isinstance(flag, str):
+            flag = str(flag)
+        normalised.add(flag.upper())
+    return normalised
 
 
-def _is_archive_folder(folder, archive_roots):
-    """Détermine si un dossier correspond à l'archive (d'où exclusion auto)."""
+def _known_folders_for_account(cur, account_name):
+    """Return folders previously observed for an account (excluding INBOX)."""
+
+    cur.execute(
+        "SELECT DISTINCT folder FROM mails WHERE account=? AND folder IS NOT NULL AND folder != ''",
+        (account_name,),
+    )
+    folders = set()
+    for (folder,) in cur.fetchall():
+        canon = canonical_folder_name(folder)
+        if not canon or canon in {"INBOX", "__DELETED__"}:
+            continue
+        folders.add(folder)
+    return folders
+
+
+def _guess_archive_candidates(cur, account_name, decision_folders):
+    """Infer archive-like folders based on historical data."""
+
+    cur.execute(
+        """
+        SELECT folder,
+               SUM(CASE WHEN decision IS NULL THEN 1 ELSE 0) AS unlabeled,
+               SUM(CASE WHEN auto_moved=1 THEN 1 ELSE 0) AS auto_moved,
+               COUNT(*) AS total
+        FROM mails
+        WHERE account=? AND folder IS NOT NULL AND folder != ''
+        GROUP BY folder
+        """,
+        (account_name,),
+    )
+    canonical = set()
+    raw_names = set()
+    for folder, unlabeled, auto_moved, total in cur.fetchall():
+        canon = canonical_folder_name(folder)
+        if not canon or canon in {"INBOX", "__DELETED__"}:
+            continue
+        if canon in decision_folders:
+            continue
+        total = total or 0
+        if total == 0:
+            continue
+        unlabeled = unlabeled or 0
+        auto_moved = auto_moved or 0
+        ratio = unlabeled / total
+        if total >= 2 and ratio >= 0.6 and auto_moved == 0:
+            canonical.add(canon)
+            raw_names.add(folder)
+    return canonical, raw_names
+
+
+def _is_probably_archived(folder, flags, decision_for_folder, archive_candidates):
+    """Heuristically determine whether a message was archived manually."""
 
     canon = canonical_folder_name(folder)
-    if not canon:
+    if not canon or canon in {"", "INBOX", "__DELETED__"}:
         return False
-    if canon in archive_roots:
+    if decision_for_folder:
+        return False
+    if canon in archive_candidates:
         return True
-    parts = [p for p in canon.split("/") if p]
-    if any(p.startswith("ARCHIVE") or p.endswith("ARCHIVE") for p in parts):
+    flag_set = _normalise_flags(flags)
+    if ("\\SEEN" in flag_set or "SEEN" in flag_set) and "\\FLAGGED" not in flag_set:
         return True
-    for root in archive_roots:
-        if root and (canon == root or canon.startswith(f"{root}/")):
-            return True
     return False
 
 # === PIPELINE STEPS ===
 def snapshot(cfg):
-    """Réalise une synchronisation IMAP et met à jour la base locale.
+    """Perform an IMAP synchronisation and refresh the local database.
 
-    Cette étape collecte les emails des dossiers surveillés, met à jour les
-    métadonnées (sujet, corps, dernier dossier vu) et tient à jour les
-    décisions prises manuellement par l'utilisateur afin d'alimenter l'apprentissage.
+    This step collects emails from the monitored folders, updates metadata
+    (subject, body, last seen folder) and keeps track of user-made decisions to
+    feed the training pipeline.
     """
 
     conn = db_init(cfg)
     cur = conn.cursor()
 
-    # Ces valeurs servent de fallback si un message disparaît d'INBOX : on les
-    # utilise pour marquer les mails comme supprimés / spam automatiquement.
+    # These values act as a fallback if a message disappears from INBOX: they
+    # are used to mark emails as deleted/spam automatically.
     delete_pref_keys = {"SPAM", "INDESIRABLE", "JUNK", "PROMOTION", "PROMOTIONS", "NEWSLETTER"}
 
     model_cfg = cfg.get("model", {}) if isinstance(cfg, dict) else {}
@@ -347,8 +394,8 @@ def snapshot(cfg):
         now_iso = datetime.utcnow().isoformat()
         print(f"{datetime.now()} [{account_name}] snapshot...")
 
-        # On récupère les règles de typage et on prépare des structures pour
-        # suivre la correspondance dossier -> décision.
+        # Fetch typing rules and prepare structures that map folders to
+        # decisions.
         mail_types = load_account_mail_types(acc)
         entries = mail_types.get("entries", {})
         enabled_keys = {k for k in mail_types.get("enabled", set()) if entries.get(k)}
@@ -356,8 +403,8 @@ def snapshot(cfg):
         folder_decisions = {}
         delete_fallback = None
 
-        # On parcourt les règles actives pour déterminer les dossiers sources à
-        # surveiller ainsi que le fallback suppression (spam, promotions...).
+        # Iterate over active rules to determine source folders to watch as well
+        # as the deletion fallback (spam, promotions, ...).
         for key in enabled_keys:
             entry = entries.get(key) or {}
             sources = _resolve_entry_folders(acc, entry)
@@ -371,31 +418,39 @@ def snapshot(cfg):
             if not delete_fallback and key and key.upper() in delete_pref_keys:
                 delete_fallback = key
 
-        archive_roots = _collect_archive_roots(acc)
+        decision_folders = set(folder_decisions.keys())
+        archive_candidates, archive_watch = _guess_archive_candidates(cur, account_name, decision_folders)
+        known_folders = _known_folders_for_account(cur, account_name)
         imap = acc["imap"]
         pwd = Path(imap["password_file"]).read_text().strip()
 
-        # On surveille systématiquement l'INBOX et, pour chaque règle, les
-        # dossiers associés (sources + cibles pour détecter les classifications).
+        # Always watch INBOX and, for each rule, the associated folders (sources
+        # + targets to detect pre-existing classifications).
         watch_folders = {"INBOX"}
         for folder in folder_sources:
+            watch_folders.add(folder)
+        # Add inferred archive folders and any location observed in previous
+        # runs so that manual moves remain visible to the synchroniser.
+        for folder in archive_watch:
+            watch_folders.add(folder)
+        for folder in known_folders:
             watch_folders.add(folder)
 
         seen = set()
 
-        # Connexion IMAP : le contexte assure la déconnexion propre.
+        # IMAP connection: the context manager guarantees a clean logout.
         with IMAPClient(imap["host"], port=imap["port"], ssl=imap["ssl"]) as srv:
             srv.login(imap["user"], pwd)
             for folder in sorted(watch_folders):
                 try:
-                    # On se met en lecture seule pour éviter de modifier les flags côté serveur.
+                    # Select in read-only mode to avoid altering server-side flags.
                     srv.select_folder(folder, readonly=True)
                 except Exception as exc:
                     print(f"[WARN] {account_name} select {folder}: {exc}")
                     continue
                 try:
-                    # Récupération de tous les UID : on ne filtre pas pour ne
-                    # manquer aucun message récent.
+                    # Fetch every UID: no filter to avoid missing recent
+                    # messages.
                     uids = srv.search()
                 except Exception as exc:
                     print(f"[WARN] {account_name} search {folder}: {exc}")
@@ -403,7 +458,7 @@ def snapshot(cfg):
                 if not uids:
                     continue
                 try:
-                    fetched = srv.fetch(uids, ["BODY.PEEK[]", "ENVELOPE"])
+                    fetched = srv.fetch(uids, ["BODY.PEEK[]", "ENVELOPE", "FLAGS"])
                 except Exception as exc:
                     print(f"[WARN] {account_name} fetch {folder}: {exc}")
                     continue
@@ -424,8 +479,8 @@ def snapshot(cfg):
                             except Exception:
                                 subject = str(env.subject)
                     if not raw_identifier:
-                        # Fallback: on compose un identifiant stable basé sur
-                        # le dossier et l'UID IMAP.
+                        # Fallback: compose a stable identifier based on the
+                        # folder and the IMAP UID.
                         raw_identifier = f"{folder}:{uid}"
 
                     body = ""
@@ -435,20 +490,27 @@ def snapshot(cfg):
                             mp = parse_from_bytes(raw_body)
                             body = mp.text_plain[0] if mp.text_plain else (mp.body or "")
                     except Exception:
-                        # Parsing parfois fragile (emails mal formés) : on ignore l'erreur.
+                        # Parsing can be brittle (malformed emails); ignore the
+                        # failure.
                         pass
 
-                    # Le nettoyage permet d'éviter d'insérer des chaînes
-                    # énormes et mal normalisées dans la base.
+                    # Cleaning avoids inserting huge, poorly normalised strings
+                    # in the database.
                     body = clean_text(body)
                     subject = clean_text(subject)
                     combined_text = clean_text(f"{subject} {body}")
 
                     canon_folder = canonical_folder_name(folder)
                     decision_for_folder = folder_decisions.get(canon_folder)
-                    archive_hit = _is_archive_folder(folder, archive_roots)
+                    flags = data.get(b"FLAGS")
+                    archive_hit = _is_probably_archived(
+                        folder,
+                        flags,
+                        decision_for_folder,
+                        archive_candidates,
+                    )
 
-                    # Trace que le message a été vu durant ce snapshot.
+                    # Record that the message was seen during this snapshot.
                     mail_key = compute_mail_key(account_name, raw_identifier, hash_salt)
                     seen.add((account_name, mail_key))
 
@@ -474,7 +536,7 @@ def snapshot(cfg):
                         ) = row
                         needs_embedding = False
                         if prev_folder != folder:
-                            # Déplacement détecté -> on met à jour dossier, UID et timestamps.
+                            # Movement detected -> update folder, UID, and timestamps.
                             updates.append("folder=?")
                             params.append(folder)
                             updates.append("imap_uid=?")
@@ -482,12 +544,12 @@ def snapshot(cfg):
                             updates.append("last_seen_at=?")
                             params.append(now_iso)
                             if prev_auto:
-                                # Si le message avait été auto-déplacé on reset
-                                # le flag pour refléter l'action manuelle.
+                                # If the message had been auto-moved, reset the
+                                # flag to reflect the manual action.
                                 updates.append("auto_moved=0")
                                 updates.append("auto_moved_at=NULL")
                         else:
-                            # Pas de déplacement : on rafraîchit simplement l'horodatage et l'UID.
+                            # No movement: simply refresh the timestamp and UID.
                             updates.append("last_seen_at=?")
                             params.append(now_iso)
                             updates.append("imap_uid=?")
@@ -501,7 +563,7 @@ def snapshot(cfg):
                         if not archive_hit:
                             if decision_for_folder:
                                 if prev_decision != decision_for_folder:
-                                    # Le dossier surveillé correspond à une règle -> on met à jour la décision.
+                                    # Folder matches a rule -> update the stored decision.
                                     updates.append("decision=?")
                                     params.append(decision_for_folder)
                                     updates.append("confidence=?")
@@ -510,8 +572,7 @@ def snapshot(cfg):
                                     updates.append("auto_moved_at=?")
                                     params.append(None)
                             elif prev_decision is not None and canon_folder == "INBOX":
-                                # Retour dans l'INBOX : on considère que la
-                                # décision est annulée.
+                                # Back to INBOX: consider the decision cancelled.
                                 updates.append("decision=NULL")
                                 updates.append("confidence=NULL")
                                 updates.append("auto_moved=0")
@@ -561,7 +622,7 @@ def snapshot(cfg):
                         if embedding_blob is None:
                             subject_value = subject
                             body_value = body
-                        # Nouveau message : on insère une ligne complète avec les métadonnées courantes.
+                        # New message: insert a full row with the current metadata.
                         cur.execute(
                             "INSERT INTO mails (account,msgid,subject,body,folder,date,decision,confidence,imap_uid,last_seen_at,auto_moved,embedding,embedding_dim,embedding_encoder) "
                             "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -583,9 +644,8 @@ def snapshot(cfg):
                             ),
                         )
 
-        # Traitement des messages qui ont disparu de l'INBOX (probablement
-        # supprimés ou classés en spam côté client) : on les marque avec le
-        # fallback défini.
+        # Handle messages that disappeared from INBOX (likely deleted or marked
+        # as spam by the user): mark them using the configured fallback.
         if delete_fallback and seen:
             cur.execute(
                 "SELECT id, msgid, folder FROM mails WHERE account=? AND folder='INBOX'",
@@ -609,7 +669,7 @@ def snapshot(cfg):
     conn.close()
 
 def retrain(cfg):
-    """Réentraîne le modèle de classification à partir des données étiquetées."""
+    """Retrain the classification model based on labelled data."""
 
     conn = db_init(cfg)
     cur = conn.cursor()
@@ -683,14 +743,14 @@ def retrain(cfg):
         conn.close()
         return
 
-    # Empilement des embeddings et conversion vers float64 pour sklearn.
+    # Stack embeddings and convert to float64 for sklearn.
     Xv = np.vstack(vectors).astype(np.float64)
     y = labels
 
     clf = LogisticRegression(max_iter=1000)
     clf.fit(Xv, y)
 
-    # Sauvegarde sur disque pour réutilisation future.
+    # Persist to disk for future reuse.
     joblib.dump(clf, MODEL_DIR / "clf.joblib")
     joblib.dump(encoder, MODEL_DIR / "encoder.joblib")
 
@@ -703,7 +763,7 @@ def retrain(cfg):
     print("[train] done")
 
 def predict(cfg, auto_move=False):
-    """Effectue des prédictions sur les emails en attente et optionnellement les déplace."""
+    """Predict labels for pending emails and optionally move them."""
 
     conn = db_init(cfg)
     cur = conn.cursor()
@@ -792,7 +852,7 @@ def predict(cfg, auto_move=False):
         decision = label
         acc = accounts_map.get(account)
 
-        # Cache des mail types pour éviter de recharger sur disque à chaque message.
+        # Cache mail types to avoid hitting the filesystem for every message.
         mail_types = mail_types_cache.get(account)
         if mail_types is None:
             mail_types = load_account_mail_types(acc)
@@ -801,7 +861,7 @@ def predict(cfg, auto_move=False):
         enabled = mail_types.get("enabled", set()) if mail_types else set()
         entry = entries.get(decision) if entries else None
 
-        # Recherche du dossier cible associé à la décision.
+        # Look up the target folder associated with the decision.
         target = None
         if entry:
             target = entry.get("target_folder") or (acc or {}).get("folders", {}).get("targets", {}).get(decision)
@@ -810,16 +870,16 @@ def predict(cfg, auto_move=False):
 
         log_msg = f"[predict] {account} -> {decision} ({conf:.2f})"
         if not enabled:
-            print(log_msg + " [aucune règle active]")
+            print(log_msg + " [no active rules]")
             continue
         if enabled and decision not in enabled:
-            print(log_msg + " [désactivé dans config]")
+            print(log_msg + " [disabled in config]")
             continue
         if entry and not entry.get("enabled", True):
-            print(log_msg + " [règle désactivée]")
+            print(log_msg + " [rule disabled]")
             continue
         if not target:
-            print(log_msg + " [pas de dossier cible]")
+            print(log_msg + " [no target folder]")
             continue
 
         print(log_msg)
@@ -828,7 +888,7 @@ def predict(cfg, auto_move=False):
             (conf, id_),
         )
 
-        # Optionnellement on déplace le message si le mode auto_move est actif.
+        # Optionally move the message if auto_move mode is enabled.
         if not (auto_move and acc and acc.get("mode", {}).get("auto_move", False) and conf > min_conf):
             continue
         if imap_uid is None:
@@ -841,7 +901,7 @@ def predict(cfg, auto_move=False):
             continue
         moves_by_account[account].append((id_, uid_int, decision, target, conf))
 
-    # Application des déplacements IMAP regroupés par compte pour limiter les connexions.
+    # Apply IMAP moves grouped by account to limit the number of connections.
     for account, items in moves_by_account.items():
         acc = accounts_map.get(account)
         if not acc:
@@ -868,7 +928,7 @@ def predict(cfg, auto_move=False):
     conn.close()
 
 def migrate_embeddings(cfg):
-    """Maintenance : recalcule les embeddings manquants et purge le texte brut."""
+    """Maintenance helper: recompute missing embeddings and purge raw text."""
 
     conn = db_init(cfg)
     cur = conn.cursor()
@@ -952,7 +1012,7 @@ def migrate_embeddings(cfg):
         print(f"[migrate] skipped rows without data: {skipped}")
 
 def stats(cfg):
-    """Affiche des statistiques de labeling par compte et par mode auto-move."""
+    """Display labelling statistics per account and auto-move mode."""
 
     conn = db_init(cfg)
     cur = conn.cursor()
@@ -1041,10 +1101,11 @@ def stats(cfg):
             print("    · (no labeled decisions)")
 
 def loop(cfg):
-    """Boucle principale : snapshot, prédiction, entraînement périodique."""
+    """Main loop: snapshot, prediction, periodic training."""
 
-    every = int(cfg["scheduler"].get("poll_every_seconds", 600))
-    retrain_every = int(cfg["scheduler"].get("retrain_every_seconds", 86400))
+    scheduler_cfg = cfg.get("scheduler") or {}
+    every = int(scheduler_cfg.get("poll_every_seconds", 600))
+    retrain_every = int(scheduler_cfg.get("retrain_every_seconds", 86400))
     last_retrain = datetime.utcnow() - timedelta(seconds=retrain_every)
     while True:
         snapshot(cfg)
