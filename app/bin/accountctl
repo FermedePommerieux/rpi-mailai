@@ -1,14 +1,61 @@
 #!/usr/bin/env python3
-import argparse, getpass, json, os, re, sys, yaml
+"""High verbosity account management CLI for MailAI.
+
+This script is responsible for every manual operation that touches the MailAI
+configuration regarding IMAP accounts.  The user explicitly requested verbose
+inline documentation, therefore every step is annotated to describe *what* the
+code does and *why* it exists.  The core features exposed by the CLI are:
+
+* discovering configuration/secrets directories while allowing overrides via
+  environment variables (the Docker deployment injects those),
+* generating a JSON template describing the mail categories that the AI model
+  manipulates ("important", "newsletter", etc.),
+* ensuring all file writes are atomic to avoid corrupting the YAML/JSON files
+  if the device powers off unexpectedly, and
+* offering five subcommands (``add``, ``update``, ``remove``, ``list`` and
+  ``test``) for day-to-day account administration.
+
+The logic sticks to straightforward data manipulation and favours clarity over
+clever tricks so that operators can easily audit the actions performed by the
+script.
+"""
+
+import argparse
+import getpass
+import json
+import os
+import re
+import sys
 from datetime import datetime
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Tuple
+
+import yaml
 from imapclient import IMAPClient
 
+# ---------------------------------------------------------------------------
+# Configuration paths
+# ---------------------------------------------------------------------------
+# ``APP_CONFIG`` lets the caller override where the YAML configuration lives.
+# The default matches the location used inside the Docker container.
 CFG_PATH = Path(os.environ.get("APP_CONFIG", "/config/config.yml"))
+
+# Secrets (one file per account containing the IMAP password) live under this
+# directory.  We centralise the path so every function writes to the same
+# location and so the directory can be created lazily when needed.
 SECRETS_DIR = Path("/config/secrets")
+
+# JSON description files describing the MailAI category prompts and mapping are
+# stored here.  ``MAIL_TYPES_DIR`` mirrors the setting used by the main app.
 MAIL_TYPES_DIR = Path(os.environ.get("MAIL_TYPES_DIR", "/config/account_types"))
 
+# ---------------------------------------------------------------------------
+# Generic prompt templates
+# ---------------------------------------------------------------------------
+# Each mail type gets a French description that is embedded into the JSON file.
+# Those prompts are consumed by MailAI to explain to the language model what it
+# should detect.  They also provide documentation for operators reading the
+# files on disk.
 GENERIC_PROMPTS = {
     "important": (
         "Classer dans le dossier Important tout message nécessitant une action rapide, "
@@ -37,28 +84,59 @@ GENERIC_PROMPTS = {
 }
 
 
-def _write_mail_types(path: Path, payload: dict):
+# ---------------------------------------------------------------------------
+# File helpers
+# ---------------------------------------------------------------------------
+
+def _write_mail_types(path: Path, payload: dict) -> None:
+    """Persist the mail-types payload to disk while remaining crash-safe.
+
+    The file is written through a ``.tmp`` suffix and then atomically moved in
+    place with ``os.replace``.  This ensures there is never a partially written
+    JSON file if the Raspberry Pi loses power mid-operation.
+    """
+
+    # Update a metadata field so operators know when the file was generated.
     payload["updated_at"] = datetime.utcnow().isoformat()
+
+    # Guarantee the destination directory exists (``mkdir`` is idempotent).
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
+
+    # Dump the JSON in UTF-8 while keeping accents readable (``ensure_ascii``).
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(payload, fh, indent=2, ensure_ascii=False)
+
+    # ``os.replace`` performs an atomic rename on POSIX systems.
     os.replace(tmp, path)
 
 
-def _sync_targets(payload: dict, mapping_targets: dict, spam_folder: str, quarantine_folder: str):
+def _sync_targets(payload: dict, mapping_targets: dict, spam_folder: str, quarantine_folder: str) -> None:
+    """Adjust target folders for each mail type using the provided mapping."""
+
     for entry in payload.get("types", []):
         key = entry.get("key")
+
+        # ``spam`` and ``quarantine`` are forced to use the dedicated folders so
+        # the model cannot accidentally move them elsewhere.
         if key == "spam" and spam_folder:
             entry["target_folder"] = spam_folder
         elif key == "quarantine" and quarantine_folder:
             entry["target_folder"] = quarantine_folder
+
+        # Optional targets (important/newsletter/…) rely on the mapping if the
+        # caller provided one.
         elif key in mapping_targets and mapping_targets.get(key):
             entry["target_folder"] = mapping_targets[key]
-        elif key == "factures":
-            # Default invoices to the project folder if nothing else is set
-            if not entry.get("target_folder"):
-                entry["target_folder"] = mapping_targets.get("projet") or quarantine_folder or spam_folder
+
+        # Invoices default to the "projet" folder, otherwise fall back to
+        # quarantine or spam so that documents are not left unclassified.
+        elif key == "factures" and not entry.get("target_folder"):
+            entry["target_folder"] = (
+                mapping_targets.get("projet")
+                or quarantine_folder
+                or spam_folder
+            )
 
 
 def ensure_mail_types(
@@ -68,6 +146,14 @@ def ensure_mail_types(
     quarantine_folder: str,
     existing_path: Optional[str] = None,
 ) -> Path:
+    """Create or merge the JSON file driving MailAI category mappings.
+
+    When ``existing_path`` is provided the function loads it and appends any
+    missing defaults so that upgrades remain backwards compatible.  Otherwise a
+    fresh payload is generated using :data:`GENERIC_PROMPTS`.
+    """
+
+    # ``base_payload`` contains every known mail type with a sensible default.
     base_payload = {
         "account": name,
         "version": 1,
@@ -117,15 +203,16 @@ def ensure_mail_types(
         ],
     }
 
+    # Either reuse the existing JSON (update flow) or create a new file next to
+    # the other account definitions.
     path = Path(existing_path) if existing_path else MAIL_TYPES_DIR / f"{name}.json"
     if path.exists():
         with open(path, "r", encoding="utf-8") as fh:
             payload = json.load(fh)
-        # Merge missing defaults without overwriting user customisations
         existing_keys = {t.get("key") for t in payload.get("types", [])}
-        for t in base_payload["types"]:
-            if t["key"] not in existing_keys:
-                payload.setdefault("types", []).append(t)
+        for entry in base_payload["types"]:
+            if entry["key"] not in existing_keys:
+                payload.setdefault("types", []).append(entry)
     else:
         payload = base_payload
 
@@ -133,124 +220,189 @@ def ensure_mail_types(
     _write_mail_types(path, payload)
     return path
 
-def load_cfg():
-    if not CFG_PATH.exists():
-        print(f"Config not found: {CFG_PATH}", file=sys.stderr); sys.exit(2)
-    with open(CFG_PATH,"r") as f: return yaml.safe_load(f)
 
-def save_cfg(cfg):
+# ---------------------------------------------------------------------------
+# Configuration helpers
+# ---------------------------------------------------------------------------
+
+def load_cfg():
+    """Read ``config.yml`` from disk and abort if the file is missing."""
+
+    if not CFG_PATH.exists():
+        print(f"Config not found: {CFG_PATH}", file=sys.stderr)
+        sys.exit(2)
+
+    with open(CFG_PATH, "r", encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def save_cfg(cfg) -> None:
+    """Write ``config.yml`` atomically to prevent corruption."""
+
     tmp = CFG_PATH.with_suffix(".tmp")
-    with open(tmp,"w") as f: yaml.safe_dump(cfg, f, sort_keys=False, allow_unicode=True)
+    with open(tmp, "w", encoding="utf-8") as fh:
+        yaml.safe_dump(cfg, fh, sort_keys=False, allow_unicode=True)
     os.replace(tmp, CFG_PATH)
 
-def norm_name(name:str)->str: return re.sub(r"[^a-zA-Z0-9_-]+","", name.strip())
 
-def find_acc(cfg, name):
-    for i,a in enumerate(cfg.get("accounts",[])):
-        if a.get("name")==name: return i,a
-    return None,None
+def norm_name(name: str) -> str:
+    """Sanitise the account name so it is safe for filenames and YAML keys."""
+
+    return re.sub(r"[^a-zA-Z0-9_-]+", "", name.strip())
+
+
+def find_acc(cfg, name: str) -> Tuple[Optional[int], Optional[dict]]:
+    """Locate an account inside the configuration and return its index."""
+
+    for idx, account in enumerate(cfg.get("accounts", [])):
+        if account.get("name") == name:
+            return idx, account
+    return None, None
+
 
 def test_imap(host, port, ssl, user, pwd):
+    """Check IMAP credentials by logging in and selecting the INBOX."""
+
     with IMAPClient(host, port=int(port), ssl=bool(ssl)) as srv:
-        srv.login(user, pwd); srv.select_folder("INBOX", readonly=True)
+        srv.login(user, pwd)
+        srv.select_folder("INBOX", readonly=True)
     return True, None
 
-def _to_str(x):
-    if isinstance(x, bytes):
-        try: return x.decode('utf-8', 'ignore')
-        except: return x.decode('latin-1', 'ignore')
-    return x
+
+# ---------------------------------------------------------------------------
+# IMAP folder helpers
+# ---------------------------------------------------------------------------
+
+def _to_str(value):
+    """Best-effort decoding helper for IMAP folder names."""
+
+    if isinstance(value, bytes):
+        try:
+            return value.decode("utf-8", "ignore")
+        except Exception:
+            return value.decode("latin-1", "ignore")
+    return value
+
 
 def detect_mailbox_style(srv):
+    """Inspect the IMAP hierarchy to discover delimiters and namespaces."""
+
     folders = srv.list_folders()
-    delim_raw = next((d for _f,d,_n in folders if d), '/')
-    delim = _to_str(delim_raw) or '/'
-    existing = {_to_str(name) for _f,_d,name in folders}
+    delim_raw = next((delim for _flags, delim, _name in folders if delim), "/")
+    delim = _to_str(delim_raw) or "/"
+    existing = {_to_str(name) for _flags, _delim, name in folders}
     has_inbox_ns = any(name.upper().startswith(f"INBOX{delim}") for name in existing)
     return delim, has_inbox_ns, existing
 
+
 def normalize_folder(user_str, delim, has_inbox_ns):
-    s = (user_str or "").strip()
-    if not s: return s
-    up = s.upper()
-    if up.startswith("INBOX/") or up.startswith("INBOX."):
-        s = s.replace("/", delim).replace(".", delim)
-        return s
-    s = s.replace("/", delim).replace(".", delim)
+    """Convert user-provided folder names to the server convention."""
+
+    name = (user_str or "").strip()
+    if not name:
+        return name
+
+    upper = name.upper()
+    if upper.startswith("INBOX/") or upper.startswith("INBOX."):
+        return name.replace("/", delim).replace(".", delim)
+
+    name = name.replace("/", delim).replace(".", delim)
     if has_inbox_ns:
-        s = f"INBOX{delim}{s}"
-    return s
+        name = f"INBOX{delim}{name}"
+    return name
+
 
 def ensure_folders(srv, targets, existing):
-    created=[]
+    """Create the IMAP folders that do not exist yet and report them."""
+
+    created = []
     for box in targets:
-        if not box: continue
+        if not box:
+            continue
         if box not in existing:
             try:
                 srv.create_folder(box)
                 created.append(box)
                 existing.add(box)
-            except Exception as e:
-                print(f"[WARN] create {box}: {e}", file=sys.stderr)
+            except Exception as exc:
+                print(f"[WARN] create {box}: {exc}", file=sys.stderr)
     return created
 
+
+# ---------------------------------------------------------------------------
+# CLI handlers
+# ---------------------------------------------------------------------------
+
 def add_account(args):
+    """Handle ``accountctl add``."""
+
     if not args.host:
-        print("[ERROR] --host is required (no default).", file=sys.stderr); sys.exit(2)
+        print("[ERROR] --host is required (no default).", file=sys.stderr)
+        sys.exit(2)
 
     cfg = load_cfg()
-    accs = cfg.setdefault("accounts", [])
+    accounts = cfg.setdefault("accounts", [])
     name = norm_name(args.name)
-    if not name: print("Invalid account name", file=sys.stderr); sys.exit(2)
-    if any(a.get("name")==name for a in accs):
-        print(f"Account '{name}' already exists.", file=sys.stderr); sys.exit(2)
+    if not name:
+        print("Invalid account name", file=sys.stderr)
+        sys.exit(2)
+    if any(acc.get("name") == name for acc in accounts):
+        print(f"Account '{name}' already exists.", file=sys.stderr)
+        sys.exit(2)
 
     SECRETS_DIR.mkdir(parents=True, exist_ok=True)
     secret_file = SECRETS_DIR / f"{name}.pass"
 
     user = args.user or input("IMAP username (email): ").strip()
-    pwd  = args.password or getpass.getpass("IMAP password: ")
+    password = args.password or getpass.getpass("IMAP password: ")
 
     try:
         with IMAPClient(args.host, port=int(args.port), ssl=not args.no_ssl) as srv:
-            srv.login(user, pwd)
+            srv.login(user, password)
             delim, has_inbox_ns, existing = detect_mailbox_style(srv)
 
-            spam_f        = args.spam        or "Junk"
-            important_f   = args.important   or "Important"
-            newsletter_f  = args.newsletter  or "Promotions"
-            projet_f      = args.projet      or "Projects"
-            basse_f       = args.basse       or "SocialNetwork"
-            quarantine_f  = args.quarantine  or "AI/A-REVIEW"
+            # Provide defaults for the various folders but allow CLI overrides.
+            spam_f = args.spam or "Junk"
+            important_f = args.important or "Important"
+            newsletter_f = args.newsletter or "Promotions"
+            projet_f = args.projet or "Projects"
+            basse_f = args.basse or "SocialNetwork"
+            quarantine_f = args.quarantine or "AI/A-REVIEW"
 
-            spam_f_n        = normalize_folder(spam_f,        delim, has_inbox_ns)
-            important_f_n   = normalize_folder(important_f,   delim, has_inbox_ns)
-            newsletter_f_n  = normalize_folder(newsletter_f,  delim, has_inbox_ns)
-            projet_f_n      = normalize_folder(projet_f,      delim, has_inbox_ns)
-            basse_f_n       = normalize_folder(basse_f,       delim, has_inbox_ns)
-            quarantine_f_n  = normalize_folder(quarantine_f,  delim, has_inbox_ns)
+            spam_f_n = normalize_folder(spam_f, delim, has_inbox_ns)
+            important_f_n = normalize_folder(important_f, delim, has_inbox_ns)
+            newsletter_f_n = normalize_folder(newsletter_f, delim, has_inbox_ns)
+            projet_f_n = normalize_folder(projet_f, delim, has_inbox_ns)
+            basse_f_n = normalize_folder(basse_f, delim, has_inbox_ns)
+            quarantine_f_n = normalize_folder(quarantine_f, delim, has_inbox_ns)
 
             if not args.no_create_folders:
-                to_create = [x for x in [spam_f_n, important_f_n, newsletter_f_n, projet_f_n, basse_f_n, quarantine_f_n] if x]
+                to_create = [
+                    folder
+                    for folder in [spam_f_n, important_f_n, newsletter_f_n, projet_f_n, basse_f_n, quarantine_f_n]
+                    if folder
+                ]
                 created = ensure_folders(srv, to_create, existing)
                 if created:
                     print("[OK] Created folders:", ", ".join(created))
 
             mapping_targets = {
-                "important":  important_f_n,
+                "important": important_f_n,
                 "newsletter": newsletter_f_n,
-                "projet":     projet_f_n,
-                "basse":      basse_f_n,
+                "projet": projet_f_n,
+                "basse": basse_f_n,
                 "quarantine": quarantine_f_n,
             }
-    except Exception as e:
-        print(f"[ERROR] IMAP connection or folder setup: {e}", file=sys.stderr); sys.exit(1)
+    except Exception as exc:
+        print(f"[ERROR] IMAP connection or folder setup: {exc}", file=sys.stderr)
+        sys.exit(1)
 
-    secret_file.write_text(pwd); os.chmod(secret_file, 0o600)
+    secret_file.write_text(password)
+    os.chmod(secret_file, 0o600)
 
     types_path = ensure_mail_types(name, mapping_targets, spam_f_n, quarantine_f_n)
 
-    new_acc = {
+    new_account = {
         "name": name,
         "imap": {
             "host": args.host,
@@ -265,13 +417,15 @@ def add_account(args):
         },
         "folders": {
             "inbox": "INBOX",
-            "spam":  spam_f_n,
-            "targets": mapping_targets
+            "spam": spam_f_n,
+            "targets": mapping_targets,
         },
         "mail_types_config": str(types_path),
-        "rules": []
+        "rules": [],
     }
-    accs.append(new_acc); save_cfg(cfg)
+
+    accounts.append(new_account)
+    save_cfg(cfg)
 
     print(f"[OK] Account '{name}' added ({user}@{args.host}). Secret: {secret_file}")
     print("Folders mapping (normalized):")
@@ -282,104 +436,165 @@ def add_account(args):
     print(f"  Social/Low  -> {mapping_targets['basse']}")
     print(f"  Quarantine  -> {mapping_targets['quarantine']}")
 
-def update_account(args):
-    cfg = load_cfg(); idx, acc = find_acc(cfg, args.name)
-    if acc is None:
-        print(f"Account '{args.name}' not found.", file=sys.stderr); sys.exit(2)
 
-    if args.user:  acc["imap"]["user"] = args.user
-    if args.host:  acc["imap"]["host"] = args.host
-    if args.port:  acc["imap"]["port"] = int(args.port)
-    if args.no_ssl is True:   acc["imap"]["ssl"] = False
-    if args.ssl is True:      acc["imap"]["ssl"] = True
+def update_account(args):
+    """Handle ``accountctl update``."""
+
+    cfg = load_cfg()
+    idx, account = find_acc(cfg, args.name)
+    if account is None:
+        print(f"Account '{args.name}' not found.", file=sys.stderr)
+        sys.exit(2)
+
+    if args.user:
+        account["imap"]["user"] = args.user
+    if args.host:
+        account["imap"]["host"] = args.host
+    if args.port:
+        account["imap"]["port"] = int(args.port)
+    if args.no_ssl is True:
+        account["imap"]["ssl"] = False
+    if args.ssl is True:
+        account["imap"]["ssl"] = True
 
     if any([args.spam, args.important, args.newsletter, args.projet, args.basse, args.quarantine]):
-        pwd = Path(acc["imap"]["password_file"]).read_text().strip()
-        with IMAPClient(acc["imap"]["host"], port=acc["imap"]["port"], ssl=acc["imap"].get("ssl",True)) as srv:
-            srv.login(acc["imap"]["user"], pwd)
+        password = Path(account["imap"]["password_file"]).read_text().strip()
+        with IMAPClient(account["imap"]["host"], port=account["imap"]["port"], ssl=account["imap"].get("ssl", True)) as srv:
+            srv.login(account["imap"]["user"], password)
             delim, has_inbox_ns, existing = detect_mailbox_style(srv)
-            def n(s): return normalize_folder(s, delim, has_inbox_ns) if s else None
-            if args.spam:       acc["folders"]["spam"] = n(args.spam)
-            t = acc["folders"].setdefault("targets", {})
-            if args.important:  t["important"]   = n(args.important)
-            if args.newsletter: t["newsletter"]  = n(args.newsletter)
-            if args.projet:     t["projet"]      = n(args.projet)
-            if args.basse:      t["basse"]       = n(args.basse)
-            if args.quarantine: t["quarantine"]  = n(args.quarantine)
-            to_create = [acc["folders"].get("spam")] + list(t.values())
-            to_create = [x for x in to_create if x]
+
+            def normalise(value):
+                return normalize_folder(value, delim, has_inbox_ns) if value else None
+
+            if args.spam:
+                account["folders"]["spam"] = normalise(args.spam)
+            targets = account.get("folders", {}).setdefault("targets", {})
+            if args.important:
+                targets["important"] = normalise(args.important)
+            if args.newsletter:
+                targets["newsletter"] = normalise(args.newsletter)
+            if args.projet:
+                targets["projet"] = normalise(args.projet)
+            if args.basse:
+                targets["basse"] = normalise(args.basse)
+            if args.quarantine:
+                targets["quarantine"] = normalise(args.quarantine)
+
+            to_create = [account["folders"].get("spam")] + list(targets.values())
+            to_create = [folder for folder in to_create if folder]
             if not args.no_create_folders:
                 created = ensure_folders(srv, to_create, existing)
                 if created:
                     print("[OK] Created folders:", ", ".join(created))
 
-    acc.setdefault("mode", {})
-    if args.auto_move: acc["mode"]["auto_move"] = True
-    if args.no_move:   acc["mode"]["auto_move"] = False
-    if args.auto_spam: acc["mode"]["auto_spam"] = True
-    if args.no_spam:   acc["mode"]["auto_spam"] = False
+    account.setdefault("mode", {})
+    if args.auto_move:
+        account["mode"]["auto_move"] = True
+    if args.no_move:
+        account["mode"]["auto_move"] = False
+    if args.auto_spam:
+        account["mode"]["auto_spam"] = True
+    if args.no_spam:
+        account["mode"]["auto_spam"] = False
 
-    targets = acc.get("folders", {}).setdefault("targets", {})
-    spam_folder = acc.get("folders", {}).get("spam")
+    targets = account.get("folders", {}).setdefault("targets", {})
+    spam_folder = account.get("folders", {}).get("spam")
     quarantine_folder = targets.get("quarantine")
-    types_path = ensure_mail_types(args.name, targets, spam_folder, quarantine_folder, acc.get("mail_types_config"))
-    acc["mail_types_config"] = str(types_path)
+    types_path = ensure_mail_types(args.name, targets, spam_folder, quarantine_folder, account.get("mail_types_config"))
+    account["mail_types_config"] = str(types_path)
 
     if args.rotate_password:
-        secret_path = Path(acc["imap"]["password_file"])
+        secret_path = Path(account["imap"]["password_file"])
         SECRETS_DIR.mkdir(parents=True, exist_ok=True)
         if not secret_path.parent.exists():
             secret_path = SECRETS_DIR / f"{args.name}.pass"
-            acc["imap"]["password_file"] = str(secret_path)
-        pwd = getpass.getpass("New IMAP password: ")
-        test_imap(acc["imap"]["host"], acc["imap"]["port"], acc["imap"]["ssl"], acc["imap"]["user"], pwd)
-        secret_path.write_text(pwd); os.chmod(secret_path, 0o600)
+            account["imap"]["password_file"] = str(secret_path)
+        new_password = getpass.getpass("New IMAP password: ")
+        test_imap(account["imap"]["host"], account["imap"]["port"], account["imap"]["ssl"], account["imap"]["user"], new_password)
+        secret_path.write_text(new_password)
+        os.chmod(secret_path, 0o600)
         print("[OK] Password updated.")
 
-    save_cfg(cfg); print(f"[OK] Account '{args.name}' updated.")
+    save_cfg(cfg)
+    print(f"[OK] Account '{args.name}' updated.")
+
 
 def remove_account(args):
-    cfg = load_cfg(); idx, acc = find_acc(cfg, args.name)
-    if acc is None:
-        print(f"Account '{args.name}' not found.", file=sys.stderr); sys.exit(2)
-    secret = acc["imap"].get("password_file")
-    types_cfg = acc.get("mail_types_config")
-    del cfg["accounts"][idx]; save_cfg(cfg)
+    """Handle ``accountctl remove``."""
+
+    cfg = load_cfg()
+    idx, account = find_acc(cfg, args.name)
+    if account is None:
+        print(f"Account '{args.name}' not found.", file=sys.stderr)
+        sys.exit(2)
+
+    secret = account["imap"].get("password_file")
+    types_cfg = account.get("mail_types_config")
+    del cfg["accounts"][idx]
+    save_cfg(cfg)
+
     if args.delete_secret and secret:
-        try: Path(secret).unlink(); print(f"[OK] Secret removed: {secret}")
-        except FileNotFoundError: pass
+        try:
+            Path(secret).unlink()
+            print(f"[OK] Secret removed: {secret}")
+        except FileNotFoundError:
+            pass
+
     if types_cfg:
         try:
             Path(types_cfg).unlink()
             print(f"[OK] Mail types config removed: {types_cfg}")
         except FileNotFoundError:
             pass
+
     print(f"[OK] Account '{args.name}' removed.")
 
+
 def list_accounts(_args):
-    cfg = load_cfg(); accs = cfg.get("accounts",[])
-    if not accs: print("(no accounts)"); return
-    for a in accs:
-        t = a.get("folders",{}).get("targets",{})
-        print(f"- {a['name']}: {a['imap']['user']} @ {a['imap']['host']}:{a['imap']['port']} "
-              f"ssl={a['imap'].get('ssl',True)} auto_move={a.get('mode',{}).get('auto_move',False)} "
-              f"auto_spam={a.get('mode',{}).get('auto_spam',False)} "
-              f"[Spam={a['folders'].get('spam')}, Important={t.get('important')}, "
-              f"Promotions={t.get('newsletter')}, Social={t.get('basse')}, "
-              f"Projects={t.get('projet')}, Quarantine={t.get('quarantine')}]")
-        if a.get("mail_types_config"):
-            print(f"    mail_types_config={a['mail_types_config']}")
+    """Handle ``accountctl list``."""
+
+    cfg = load_cfg()
+    accounts = cfg.get("accounts", [])
+    if not accounts:
+        print("(no accounts)")
+        return
+
+    for account in accounts:
+        targets = account.get("folders", {}).get("targets", {})
+        print(
+            f"- {account['name']}: {account['imap']['user']} @ {account['imap']['host']}:{account['imap']['port']} "
+            f"ssl={account['imap'].get('ssl', True)} auto_move={account.get('mode', {}).get('auto_move', False)} "
+            f"auto_spam={account.get('mode', {}).get('auto_spam', False)} "
+            f"[Spam={account['folders'].get('spam')}, Important={targets.get('important')}, "
+            f"Promotions={targets.get('newsletter')}, Social={targets.get('basse')}, "
+            f"Projects={targets.get('projet')}, Quarantine={targets.get('quarantine')}]"
+        )
+        if account.get("mail_types_config"):
+            print(f"    mail_types_config={account['mail_types_config']}")
+
 
 def test_account(args):
-    cfg = load_cfg(); _idx, acc = find_acc(cfg, args.name)
-    if acc is None:
-        print(f"Account '{args.name}' not found.", file=sys.stderr); sys.exit(2)
-    user=acc["imap"]["user"]; host=acc["imap"]["host"]; port=acc["imap"]["port"]; ssl=acc["imap"].get("ssl",True)
-    pwd = Path(acc["imap"]["password_file"]).read_text().strip()
-    test_imap(host, port, ssl, user, pwd)
+    """Handle ``accountctl test``."""
+
+    cfg = load_cfg()
+    _idx, account = find_acc(cfg, args.name)
+    if account is None:
+        print(f"Account '{args.name}' not found.", file=sys.stderr)
+        sys.exit(2)
+
+    user = account["imap"]["user"]
+    host = account["imap"]["host"]
+    port = account["imap"]["port"]
+    ssl = account["imap"].get("ssl", True)
+    password = Path(account["imap"]["password_file"]).read_text().strip()
+
+    test_imap(host, port, ssl, user, password)
     print(f"[OK] IMAP connection for '{args.name}' succeeded.")
 
+
 def main():
+    """Parse CLI arguments and dispatch to the appropriate handler."""
+
     ap = argparse.ArgumentParser(description="Account management for RPi-MailAI")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
@@ -403,14 +618,23 @@ def main():
 
     ap_up = sub.add_parser("update", help="Update an account or folder mapping")
     ap_up.add_argument("name")
-    ap_up.add_argument("--user"); ap_up.add_argument("--host"); ap_up.add_argument("--port")
-    sslgrp = ap_up.add_mutually_exclusive_group()
-    sslgrp.add_argument("--ssl", action="store_true"); sslgrp.add_argument("--no-ssl", action="store_true")
-    ap_up.add_argument("--spam"); ap_up.add_argument("--important"); ap_up.add_argument("--newsletter")
-    ap_up.add_argument("--projet"); ap_up.add_argument("--basse"); ap_up.add_argument("--quarantine")
+    ap_up.add_argument("--user")
+    ap_up.add_argument("--host")
+    ap_up.add_argument("--port")
+    ssl_group = ap_up.add_mutually_exclusive_group()
+    ssl_group.add_argument("--ssl", action="store_true")
+    ssl_group.add_argument("--no-ssl", action="store_true")
+    ap_up.add_argument("--spam")
+    ap_up.add_argument("--important")
+    ap_up.add_argument("--newsletter")
+    ap_up.add_argument("--projet")
+    ap_up.add_argument("--basse")
+    ap_up.add_argument("--quarantine")
     ap_up.add_argument("--no-create-folders", action="store_true", help="Do not auto-create missing folders")
-    ap_up.add_argument("--auto-move", action="store_true"); ap_up.add_argument("--no-move", action="store_true")
-    ap_up.add_argument("--auto-spam", action="store_true"); ap_up.add_argument("--no-spam", action="store_true")
+    ap_up.add_argument("--auto-move", action="store_true")
+    ap_up.add_argument("--no-move", action="store_true")
+    ap_up.add_argument("--auto-spam", action="store_true")
+    ap_up.add_argument("--no-spam", action="store_true")
     ap_up.add_argument("--rotate-password", action="store_true", help="Change password (tests live)")
     ap_up.set_defaults(func=update_account)
 
@@ -419,10 +643,16 @@ def main():
     ap_rm.add_argument("--delete-secret", action="store_true", help="Also delete stored secret file")
     ap_rm.set_defaults(func=remove_account)
 
-    ap_ls = sub.add_parser("list", help="List accounts"); ap_ls.set_defaults(func=list_accounts)
+    ap_ls = sub.add_parser("list", help="List accounts")
+    ap_ls.set_defaults(func=list_accounts)
+
     ap_test = sub.add_parser("test", help="Test IMAP connection for an account")
-    ap_test.add_argument("name"); ap_test.set_defaults(func=test_account)
+    ap_test.add_argument("name")
+    ap_test.set_defaults(func=test_account)
 
-    args = ap.parse_args(); args.func(args)
+    args = ap.parse_args()
+    args.func(args)
 
-if __name__ == "__main__": main()
+
+if __name__ == "__main__":
+    main()
