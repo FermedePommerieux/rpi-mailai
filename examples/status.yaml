@@ -1,0 +1,60 @@
+run_id: "2025-02-12T08:15:00Z"
+config_checksum: "sha256:example"
+mailbox: "MailIA"
+last_run_started_at: "2025-02-12T08:15:00Z"
+last_run_finished_at: "2025-02-12T08:15:05Z"
+mode:
+  dry_run: true
+  learner: true
+summary:
+  scanned_messages: 128
+  matched_messages: 46
+  actions_applied: 42
+  errors: 1
+  warnings: 2
+by_rule:
+  newsletters:
+    matches: 30
+    actions: 30
+    errors: 0
+  family-updates:
+    matches: 6
+    actions: 12
+    errors: 0
+learning:
+  last_train_started_at: "2025-02-11T22:00:00Z"
+  last_train_finished_at: "2025-02-11T22:04:30Z"
+  samples_used: 512
+  classes:
+    - "Reading/Newsletters"
+    - "Priority/Family"
+    - "Archive"
+  macro_f1: 0.87
+  proposed_rules: 1
+  delete_semantics:
+    spam_score_high: 12
+    conversation_closed: 4
+privacy:
+  feature_store_encrypted: true
+  plaintext_leaks_detected: 0
+  pepper_rotation_due: false
+notes:
+  - "Observed 2 messages exceeding max size window; they were redacted."
+  - "One IMAP move retried due to transient network error."
+proposals:
+  - rule_id: "auto-1"
+    diff: |
+      + id: "auto-1"
+      + description: "Model-derived rule for feature doe-family"
+      + why: "Automated learner suggested this rule based on consistent gestures"
+      + source: learner
+      + enabled: false
+      + priority: 40
+      + match:
+      +   any:
+      +     - category_pred:
+      +         equals: "Priority/Family"
+      +         prob_gte: 0.85
+      + actions:
+      +   - add_label: "Priority/Family"
+    why: "Repeated manual moves of family threads suggest automating the workflow"

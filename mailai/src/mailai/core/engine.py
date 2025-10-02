@@ -169,8 +169,13 @@ class Engine:
 
     def _materialise_actions(self, rule: Rule, message: Message) -> List[ActionRequest]:
         actions: List[ActionRequest] = []
+        quarantine = getattr(self.client, "quarantine_mailbox", None)
         for action in rule.actions:
             for name, value in _action_to_pairs(action):
+                if self.defaults.dry_run and name in {"move_to", "delete"}:
+                    if quarantine:
+                        actions.append(ActionRequest(uid=message.uid, name="copy_to", value=quarantine))
+                    continue
                 actions.append(ActionRequest(uid=message.uid, name=name, value=value))
         if not self.defaults.dry_run:
             header_value = f"run={self.run_id}; rule={rule.id}"

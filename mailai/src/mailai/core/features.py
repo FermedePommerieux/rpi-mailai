@@ -18,12 +18,12 @@ class FeatureSketch:
     simhash: int
 
 
-def extract_features(raw_message: bytes, *, pepper: bytes) -> Dict[str, object]:
+def extract_features(raw_message: bytes, *, pepper: bytes, salt: bytes) -> Dict[str, object]:
     """Extract hashed features from a raw email message."""
 
     _, headers, body = parse_message(raw_message)
     domains = _extract_domains(headers)
-    hasher = PepperHasher(pepper)
+    hasher = PepperHasher(pepper=pepper, salt=salt)
     tokens = _tokenise(body)
     hashed = hasher.hash_tokens(tokens)
     sketch = FeatureSketch(tokens=hashed[:128], simhash=hasher.simhash(tokens))
@@ -37,10 +37,10 @@ def extract_features(raw_message: bytes, *, pepper: bytes) -> Dict[str, object]:
     }
 
 
-def hash_text_window(text: str, pepper: bytes) -> FeatureSketch:
+def hash_text_window(text: str, *, pepper: bytes, salt: bytes) -> FeatureSketch:
     """Produce a hashed sketch from a text snippet."""
 
-    hasher = PepperHasher(pepper)
+    hasher = PepperHasher(pepper=pepper, salt=salt)
     tokens = _tokenise(text)
     hashed = hasher.hash_tokens(tokens)
     return FeatureSketch(tokens=hashed[:128], simhash=hasher.simhash(tokens))

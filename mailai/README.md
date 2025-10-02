@@ -42,6 +42,31 @@ and never persists cleartext email data.
 - `mailai learn-now`: trigger the learning pipeline immediately.
 - `mailai diag --redact`: emit a redacted diagnostics report.
 
+## IMAP YAML Configuration
+
+MailAI stores its configuration and diagnostics inside the IMAP account under a
+dedicated control namespace. By default the agent creates a `MailIA/`
+mailbox that contains two human-readable messages:
+
+- **`MailAI: rules.yaml`** – the authoritative configuration described by the
+  [`RulesV2`](mailai/src/mailai/config/schema.py) schema. Every rule must include
+  a human-facing `description`, a justification in `why`, and a `source`
+  indicating whether the rule was `deterministic` or emitted by the
+  `learner`. The agent automatically restores a minimal rule-set if the file is
+  missing or becomes corrupted and keeps a mirror copy as
+  `MailAI: rules.bak.yaml`.
+- **`MailAI: status.yaml`** – the latest diagnostic snapshot following the
+  [`StatusV2`](mailai/src/mailai/config/schema.py) schema. It records aggregate
+  metrics, privacy checks, and a `proposals` section where learner-generated
+  rules are rendered as YAML diffs with an explanation.
+
+Both messages are limited to 128 KB. MailAI attempts to keep the payload below
+64 KB by truncating verbose sections such as `notes` and `proposals` while
+preserving the most relevant entries. Example documents are provided under
+[`examples/rules.yaml`](../examples/rules.yaml) and
+[`examples/status.yaml`](../examples/status.yaml). Account bootstrap data for
+`accountctl` is illustrated in [`examples/accounts.yaml`](../examples/accounts.yaml).
+
 ## Testing
 
 ```bash

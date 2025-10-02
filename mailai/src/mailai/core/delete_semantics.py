@@ -22,6 +22,14 @@ def infer(signals: Iterable[str]) -> Dict[str, DeleteSignal]:
             result[signal] = DeleteSignal(reason="Resolved thread", score=0.6)
         elif signal == "calendar_invite_past":
             result[signal] = DeleteSignal(reason="Past event", score=0.8)
+        elif signal == "spam_score_high":
+            result[signal] = DeleteSignal(reason="Spam classifier confidence high", score=0.95)
+        elif signal == "promotion_sender":
+            result[signal] = DeleteSignal(reason="Promotional blast detected", score=0.75)
+        elif signal == "conversation_closed":
+            result[signal] = DeleteSignal(reason="Conversation archived by user", score=0.65)
+        elif signal == "invite_expired":
+            result[signal] = DeleteSignal(reason="Calendar invite no longer valid", score=0.85)
         elif signal == "list_unsubscribe_present":
             result[signal] = DeleteSignal(reason="Unsubscribe available", score=0.5)
         elif signal.startswith("age_gt_days"):
