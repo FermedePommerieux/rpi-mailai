@@ -33,6 +33,10 @@ from typing import Optional, Tuple
 import yaml
 from imapclient import IMAPClient
 
+# Lightweight cache for the local encoder so repeated runs avoid reloading the
+# model from disk.
+_ENCODER_CACHE = {}
+
 # ---------------------------------------------------------------------------
 # Configuration paths
 # ---------------------------------------------------------------------------
@@ -82,6 +86,129 @@ GENERIC_PROMPTS = {
         "mention explicite de facture ou facturation et présence d'une pièce jointe PDF."
     ),
 }
+
+# ---------------------------------------------------------------------------
+# Folder intent prompts for the local LLM / encoder
+# ---------------------------------------------------------------------------
+
+FOLDER_INTENT_PROMPTS = [
+    {
+        "key": "spam",
+        "label": "Courrier indésirable / Spam",
+        "description": (
+            "Dossier pour le courrier indésirable, les spams, pourriels et messages"
+            " suspects qui doivent être isolés du reste de la boîte de réception."
+        ),
+        "aliases": [
+            "spam",
+            "junk",
+            "pourriel",
+            "indesirable",
+            "indésirable",
+            "courrier indesirable",
+            "junk mail",
+            "trash",
+        ],
+    },
+    {
+        "key": "quarantine",
+        "label": "Quarantaine / Revue manuelle",
+        "description": (
+            "Dossier intermédiaire pour les messages ambigus nécessitant une revue"
+            " humaine avant décision finale."
+        ),
+        "aliases": ["quarantaine", "review", "a-review", "to review"],
+    },
+    {
+        "key": "important",
+        "label": "Important / Prioritaire",
+        "description": (
+            "Dossier réservé aux messages critiques, clients prioritaires ou"
+            " nécessitant une action rapide."
+        ),
+        "aliases": ["important", "prioritaire", "urgent", "high priority"],
+    },
+    {
+        "key": "newsletter",
+        "label": "Newsletters / Promotions",
+        "description": (
+            "Dossier dédié aux newsletters, promotions marketing, campagnes"
+            " commerciales et emails automatisés d'information."
+        ),
+        "aliases": [
+            "newsletter",
+            "promotions",
+            "promo",
+            "marketing",
+            "mailing list",
+        ],
+    },
+    {
+        "key": "projet",
+        "label": "Projets / Gestion d'équipe",
+        "description": (
+            "Dossier lié aux projets en cours : échanges d'équipe, suivi de livrables"
+            " ou coordination de missions."
+        ),
+        "aliases": ["projet", "project", "projects", "team", "mission"],
+    },
+    {
+        "key": "basse",
+        "label": "Faible priorité / Réseaux sociaux",
+        "description": (
+            "Dossier pour les notifications sociales, alertes automatiques et autres"
+            " messages de faible importance."
+        ),
+        "aliases": ["social", "reseaux", "réseaux", "low priority", "notifications"],
+    },
+    {
+        "key": "archive_general",
+        "label": "Archive générale",
+        "description": (
+            "Dossier servant à archiver les messages traités ou terminés pour"
+            " conserver un historique."
+        ),
+        "aliases": ["archive", "archives", "archivés", "archived", "historique"],
+    },
+    {
+        "key": "archive_factures",
+        "label": "Archive factures / Comptabilité",
+        "description": (
+            "Dossier d'archivage dédié aux factures, documents comptables ou"
+            " pièces jointes financières."
+        ),
+        "aliases": ["facture", "factures", "invoice", "invoices", "compta", "billing"],
+    },
+    {
+        "key": "clients",
+        "label": "Clients / Comptes clés",
+        "description": (
+            "Dossier consacré aux clients, prospects, comptes clés ou échanges"
+            " commerciaux importants."
+        ),
+        "aliases": ["client", "clients", "customer", "customers", "crm", "prospect"],
+    },
+    {
+        "key": "support",
+        "label": "Support / Tickets",
+        "description": (
+            "Dossier pour les tickets de support, demandes d'assistance ou suivi"
+            " de SAV."
+        ),
+        "aliases": ["support", "sav", "helpdesk", "ticket", "assistance"],
+    },
+    {
+        "key": "orders",
+        "label": "Commandes / e-commerce",
+        "description": (
+            "Dossier regroupant les commandes, confirmations d'achat ou"
+            " notifications d'expédition."
+        ),
+        "aliases": ["commande", "commandes", "order", "orders", "shop", "ecommerce"],
+    },
+]
+
+FOLDER_SUGGESTION_THRESHOLD = 0.58
 
 
 # ---------------------------------------------------------------------------
@@ -222,6 +349,155 @@ def ensure_mail_types(
 
 
 # ---------------------------------------------------------------------------
+# Folder intent analysis
+# ---------------------------------------------------------------------------
+
+def _load_local_encoder(enc_name: str):
+    """Load the local SentenceTransformer encoder used for intent inference."""
+
+    if not enc_name:
+        return None
+
+    encoder = _ENCODER_CACHE.get(enc_name)
+    if encoder is not None:
+        return encoder
+
+    try:
+        from sentence_transformers import SentenceTransformer
+    except ImportError as exc:  # pragma: no cover - dependency missing on host
+        print(
+            f"[WARN] sentence-transformers unavailable: folder analysis disabled ({exc})",
+            file=sys.stderr,
+        )
+        return None
+
+    print(f"[LLM] loading local encoder '{enc_name}' for folder analysis…")
+    encoder = SentenceTransformer(enc_name)
+    _ENCODER_CACHE[enc_name] = encoder
+    return encoder
+
+
+def _aliases_for(folder: str) -> str:
+    """Return a lowercase helper string for alias matching."""
+
+    return re.sub(r"[^a-z0-9]+", " ", (folder or "").lower()).strip()
+
+
+def analyse_folder_intents(existing_folders, cfg, delim: str):
+    """Infer probable usage for folders using the local embedding model."""
+
+    folders = []
+    for raw in sorted(existing_folders):
+        if not raw:
+            continue
+        name = _to_str(raw)
+        if not name or name.upper() == "INBOX":
+            continue
+        folders.append(name)
+
+    if not folders:
+        return {}
+
+    enc_name = ((cfg.get("model") or {}).get("encoder") if isinstance(cfg, dict) else None)
+    if not enc_name:
+        enc_name = "sentence-transformers/all-MiniLM-L6-v2"
+
+    encoder = _load_local_encoder(enc_name)
+    if encoder is None:
+        return {}
+
+    try:
+        import numpy as np
+    except ImportError as exc:  # pragma: no cover - dependency missing on host
+        print(f"[WARN] numpy unavailable: folder analysis disabled ({exc})", file=sys.stderr)
+        return {}
+
+    prompt_texts = [entry["description"] for entry in FOLDER_INTENT_PROMPTS]
+    folder_texts = []
+    alias_helpers = []
+    for folder in folders:
+        clean = folder.replace(delim, " ")
+        clean = re.sub(r"[_.-]+", " ", clean)
+        folder_texts.append(f"Dossier email nommé '{clean}'.")
+        alias_helpers.append(_aliases_for(folder))
+
+    prompt_vectors = encoder.encode(
+        prompt_texts,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    )
+    folder_vectors = encoder.encode(
+        folder_texts,
+        show_progress_bar=False,
+        normalize_embeddings=True,
+    )
+
+    scores = np.matmul(folder_vectors, prompt_vectors.T)
+
+    analysis = {
+        "encoder": enc_name,
+        "generated_at": datetime.utcnow().isoformat(),
+        "folders": {},
+    }
+
+    for idx, folder in enumerate(folders):
+        row = scores[idx]
+        matches = []
+        alias_base = alias_helpers[idx]
+        for prompt_idx, prompt in enumerate(FOLDER_INTENT_PROMPTS):
+            base_score = float(row[prompt_idx])
+            alias_hit = None
+            for alias in prompt.get("aliases", []):
+                normalized = alias.lower().strip()
+                if normalized and normalized in alias_base:
+                    alias_hit = alias
+                    base_score += 0.2
+                    break
+            match = {
+                "key": prompt["key"],
+                "label": prompt["label"],
+                "score": round(min(max(base_score, -1.0), 1.0), 4),
+            }
+            if alias_hit:
+                match["alias"] = alias_hit
+            matches.append(match)
+
+        matches.sort(key=lambda entry: entry["score"], reverse=True)
+        analysis["folders"][folder] = matches[:5]
+
+    return analysis
+
+
+def suggest_folder_for_role(analysis: dict, role: str, threshold: float = FOLDER_SUGGESTION_THRESHOLD):
+    """Return the folder that best matches ``role`` according to the analysis."""
+
+    if not analysis:
+        return None
+
+    folders = analysis.get("folders", {})
+    best_folder = None
+    best_score = threshold
+    alias_priority = False
+
+    for folder, matches in folders.items():
+        for entry in matches:
+            if entry.get("key") != role:
+                continue
+            score = entry.get("score", 0.0)
+            alias_hit = bool(entry.get("alias"))
+            if alias_hit:
+                if not alias_priority or score > best_score:
+                    best_folder = folder
+                    best_score = score
+                    alias_priority = True
+            elif not alias_priority and score > best_score:
+                best_folder = folder
+                best_score = score
+
+    return best_folder
+
+
+# ---------------------------------------------------------------------------
 # Configuration helpers
 # ---------------------------------------------------------------------------
 
@@ -356,10 +632,27 @@ def add_account(args):
     user = args.user or input("IMAP username (email): ").strip()
     password = args.password or getpass.getpass("IMAP password: ")
 
+    folder_analysis = {}
+
     try:
         with IMAPClient(args.host, port=int(args.port), ssl=not args.no_ssl) as srv:
             srv.login(user, password)
             delim, has_inbox_ns, existing = detect_mailbox_style(srv)
+
+            folder_analysis = analyse_folder_intents(existing, cfg, delim)
+            if folder_analysis.get("folders"):
+                print("[INFO] Folder intent analysis (local encoder):")
+                for folder, matches in folder_analysis["folders"].items():
+                    top = matches[0]
+                    extras = ", ".join(
+                        f"{entry['label']} {entry['score']:.2f}"
+                        for entry in matches[1:3]
+                    )
+                    suffix = f" | {extras}" if extras else ""
+                    alias_note = f" (alias: {top['alias']})" if top.get("alias") else ""
+                    print(
+                        f"  - {folder}: {top['label']} {top['score']:.2f}{alias_note}{suffix}"
+                    )
 
             # Provide defaults for the various folders but allow CLI overrides.
             spam_f = args.spam or "Junk"
@@ -368,6 +661,37 @@ def add_account(args):
             projet_f = args.projet or "Projects"
             basse_f = args.basse or "SocialNetwork"
             quarantine_f = args.quarantine or "AI/A-REVIEW"
+
+            if not args.spam:
+                suggested = suggest_folder_for_role(folder_analysis, "spam")
+                if suggested:
+                    spam_f = suggested
+                    print(f"[INFO] Using suggested spam folder: {spam_f}")
+            if not args.important:
+                suggested = suggest_folder_for_role(folder_analysis, "important")
+                if suggested:
+                    important_f = suggested
+                    print(f"[INFO] Using suggested important folder: {important_f}")
+            if not args.newsletter:
+                suggested = suggest_folder_for_role(folder_analysis, "newsletter")
+                if suggested:
+                    newsletter_f = suggested
+                    print(f"[INFO] Using suggested newsletter folder: {newsletter_f}")
+            if not args.projet:
+                suggested = suggest_folder_for_role(folder_analysis, "projet")
+                if suggested:
+                    projet_f = suggested
+                    print(f"[INFO] Using suggested project folder: {projet_f}")
+            if not args.basse:
+                suggested = suggest_folder_for_role(folder_analysis, "basse")
+                if suggested:
+                    basse_f = suggested
+                    print(f"[INFO] Using suggested low-priority folder: {basse_f}")
+            if not args.quarantine:
+                suggested = suggest_folder_for_role(folder_analysis, "quarantine")
+                if suggested:
+                    quarantine_f = suggested
+                    print(f"[INFO] Using suggested quarantine folder: {quarantine_f}")
 
             spam_f_n = normalize_folder(spam_f, delim, has_inbox_ns)
             important_f_n = normalize_folder(important_f, delim, has_inbox_ns)
@@ -402,6 +726,18 @@ def add_account(args):
 
     types_path = ensure_mail_types(name, mapping_targets, spam_f_n, quarantine_f_n)
 
+    if folder_analysis:
+        suggestions = {
+            key: suggest_folder_for_role(folder_analysis, key)
+            for key in ["spam", "important", "newsletter", "projet", "basse", "quarantine"]
+        }
+        folder_analysis = {
+            "encoder": folder_analysis.get("encoder"),
+            "generated_at": folder_analysis.get("generated_at"),
+            "folders": folder_analysis.get("folders", {}),
+            "suggestions": {k: v for k, v in suggestions.items() if v},
+        }
+
     new_account = {
         "name": name,
         "imap": {
@@ -423,6 +759,9 @@ def add_account(args):
         "mail_types_config": str(types_path),
         "rules": [],
     }
+
+    if folder_analysis:
+        new_account.setdefault("analysis", {})["folder_intents"] = folder_analysis
 
     accounts.append(new_account)
     save_cfg(cfg)
