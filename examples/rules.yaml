@@ -1,0 +1,57 @@
+version: 2
+meta:
+  description: "Default MailAI configuration"
+  owner: "operator@example.com"
+  updated_at: "2025-01-01T00:00:00+00:00"
+schedule:
+  learn_cron: "30 2 * * *"
+  inference_interval_s: 60
+privacy:
+  feature_store_path: "/var/lib/mailai/features.db"
+  encryption:
+    enabled: true
+    key_path: "/etc/mailai/key.bin"
+  hashing_pepper_path: "/etc/mailai/pepper.bin"
+  max_plaintext_window_chars: 0
+learning:
+  enabled: true
+  window_days: 60
+  min_samples_per_class: 20
+  llm:
+    provider: "llama.cpp"
+    model: "qwen2.5-3b-instruct-q4_0.gguf"
+    max_tokens: 128
+    temperature: 0.2
+  embeddings:
+    enabled: true
+    backend: "gguf-emb"
+    dim: 384
+  rule_synthesis:
+    enabled: true
+    max_rules_per_pass: 3
+    require_user_confirmation: true
+  delete_semantics:
+    infer_meaning: true
+    signals:
+      - "thread_is_resolved"
+      - "list_unsubscribe_present"
+      - "age_gt_days:14"
+defaults:
+  case_sensitive: false
+  stop_on_first_match: false
+  dry_run: false
+rules:
+  - id: move-newsletters
+    description: "Move newsletters to dedicated folder"
+    priority: 10
+    match:
+      any:
+        - header:
+            name: "List-Id"
+            contains: "."
+        - subject:
+            contains: "newsletter"
+    actions:
+      - add_label: "Newsletters"
+      - move_to: "INBOX/Newsletters"
+      - mark_read: true
