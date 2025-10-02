@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=65", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "mailai"
+version = "0.1.0"
+description = "Privacy-preserving offline email triage agent for Raspberry Pi"
+readme = "README.md"
+requires-python = ">=3.11"
+authors = [
+  { name = "MailAI Project" }
+]
+license = { file = "LICENSE" }
+dependencies = [
+  "pydantic>=2.6",
+  "PyYAML>=6.0",
+  "croniter>=2.0",
+  "imapclient>=2.3",
+  "pynacl>=1.5"
+]
+
+[project.optional-dependencies]
+test = [
+  "pytest>=7.4",
+  "pytest-cov>=4.1"
+]
+
+[project.scripts]
+mailai = "mailai.cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = ["mailai"]
+
+[tool.pytest.ini_options]
+minversion = "7.4"
+addopts = "-ra"
+testpaths = ["tests"]
