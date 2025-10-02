@@ -92,13 +92,14 @@ class PepperHasher:
     """Peppered hashing of message features for privacy."""
 
     pepper: bytes
+    salt: bytes
 
     def hash_tokens(self, tokens: Iterable[str]) -> List[str]:
         """Hash tokens using SHA-256 and the configured pepper."""
 
         result: List[str] = []
         for token in tokens:
-            digest = hashlib.sha256(self.pepper + token.encode("utf-8")).hexdigest()
+            digest = hashlib.sha256(self.salt + self.pepper + token.encode("utf-8")).hexdigest()
             result.append(digest)
         return result
 
@@ -107,7 +108,7 @@ class PepperHasher:
 
         accum = [0] * 64
         for token in tokens:
-            digest = hashlib.sha256(self.pepper + token.encode("utf-8")).digest()
+            digest = hashlib.sha256(self.salt + self.pepper + token.encode("utf-8")).digest()
             bits = int.from_bytes(digest[:8], "big")
             for idx in range(64):
                 if bits & (1 << idx):

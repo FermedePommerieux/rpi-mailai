@@ -49,7 +49,11 @@ def _parse_block(lines: List[str], indent: int, index: int) -> Tuple[Any, int]:
         stripped = line.strip()
         if not stripped or stripped.startswith("#"):
             continue
-        if stripped.startswith("- "):
+        if stripped == "{}":
+            return {}, idx
+        if stripped == "[]":
+            return [], idx
+        if stripped.startswith("-"):
             return _parse_list(block_lines, indent), idx
         break
     return _parse_mapping(block_lines, indent), idx
@@ -87,8 +91,11 @@ def _parse_mapping(lines: List[str], indent: int) -> Dict[str, Any]:
                     break
                 sub_lines.append(next_line)
                 idx += 1
-            value_parsed, _ = _parse_block(sub_lines, current_indent + 2, 0)
-            result[key] = value_parsed
+            if not any(line.strip() for line in sub_lines):
+                result[key] = ""
+            else:
+                value_parsed, _ = _parse_block(sub_lines, current_indent + 2, 0)
+                result[key] = value_parsed
         else:
             result[key] = _parse_scalar(value.strip())
     return result
@@ -106,7 +113,7 @@ def _parse_list(lines: List[str], indent: int) -> List[Any]:
         current_indent = len(line) - len(line.lstrip(" "))
         if current_indent < indent:
             break
-        if not stripped.startswith("- "):
+        if not stripped.startswith("-"):
             raise ValueError("Invalid list entry")
         item_lines: List[str] = [line]
         idx += 1
@@ -129,7 +136,8 @@ def _parse_list(lines: List[str], indent: int) -> List[Any]:
 
 def _parse_list_item(lines: List[str], indent: int) -> Any:
     first = lines[0]
-    value_part = first.strip()[2:]
+    stripped = first.strip()
+    value_part = stripped[2:] if len(stripped) > 1 else ""
     nested_lines = lines[1:]
     if value_part == "" and not nested_lines:
         return None
@@ -177,6 +185,8 @@ def _parse_scalar(token: str) -> Any:
 def _dump_simple_yaml(data: Any, indent: int = 0) -> str:
     space = " " * indent
     if isinstance(data, dict):
+        if not data:
+            return f"{space}{{}}"
         lines = []
         for key, value in data.items():
             if isinstance(value, (dict, list)):
@@ -186,6 +196,8 @@ def _dump_simple_yaml(data: Any, indent: int = 0) -> str:
                 lines.append(f"{space}{key}: {_format_scalar(value)}")
         return "\n".join(lines)
     if isinstance(data, list):
+        if not data:
+            return f"{space}[]"
         lines = []
         for item in data:
             if isinstance(item, (dict, list)):
@@ -205,6 +217,8 @@ def _format_scalar(value: Any) -> str:
     if value is None:
         return "null"
     text = str(value)
+    if text == "":
+        return '""'
     if any(ch in text for ch in [":", "#", "\n", "\\"]):
         return f'"{text}"'
     return text

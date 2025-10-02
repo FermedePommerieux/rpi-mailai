@@ -45,6 +45,14 @@ def _ensure_dict(name: str, value: Any) -> Dict[str, Any]:
     return value
 
 
+def _ensure_enum(name: str, value: Any, *, allowed: List[str]) -> str:
+    if not isinstance(value, str):
+        raise ValidationError(f"{name} expected string from {allowed}")
+    if value not in allowed:
+        raise ValidationError(f"{name} must be one of {allowed}")
+    return value
+
+
 def _ensure_number(name: str, value: Any) -> float:
     if not isinstance(value, (int, float)):
         raise ValidationError(f"{name} expected number")
@@ -146,6 +154,7 @@ class PrivacyConfig:
     feature_store_path: str
     encryption: EncryptionConfig
     hashing_pepper_path: str
+    hashing_salt_path: str
     max_plaintext_window_chars: int
 
     @classmethod
@@ -153,7 +162,13 @@ class PrivacyConfig:
         _ensure_keys(
             "privacy",
             data,
-            ["feature_store_path", "encryption", "hashing_pepper_path", "max_plaintext_window_chars"],
+            [
+                "feature_store_path",
+                "encryption",
+                "hashing_pepper_path",
+                "hashing_salt_path",
+                "max_plaintext_window_chars",
+            ],
         )
         return cls(
             feature_store_path=_ensure_type(
@@ -162,6 +177,9 @@ class PrivacyConfig:
             encryption=EncryptionConfig.from_dict(_ensure_dict("privacy.encryption", _require(data, "encryption"))),
             hashing_pepper_path=_ensure_type(
                 "privacy.hashing_pepper_path", _require(data, "hashing_pepper_path"), str
+            ),
+            hashing_salt_path=_ensure_type(
+                "privacy.hashing_salt_path", _require(data, "hashing_salt_path"), str
             ),
             max_plaintext_window_chars=int(
                 _ensure_type(
@@ -301,7 +319,7 @@ class DefaultsConfig:
         return cls(
             case_sensitive=_ensure_bool("defaults.case_sensitive", data.get("case_sensitive", False)),
             stop_on_first_match=_ensure_bool("defaults.stop_on_first_match", data.get("stop_on_first_match", False)),
-            dry_run=_ensure_bool("defaults.dry_run", data.get("dry_run", False)),
+            dry_run=_ensure_bool("defaults.dry_run", data.get("dry_run", True)),
         )
 
 
@@ -327,7 +345,8 @@ class RuleMatch:
 class Rule:
     id: str
     description: str
-    source: Optional[str]
+    why: str
+    source: str
     enabled: bool
     priority: int
     match: RuleMatch
@@ -338,17 +357,74 @@ class Rule:
         _ensure_keys(
             "rule",
             data,
-            ["id", "description", "source", "enabled", "priority", "match", "actions"],
+            ["id", "description", "why", "source", "enabled", "priority", "match", "actions"],
         )
         return cls(
             id=_ensure_type("rule.id", _require(data, "id"), str),
             description=_ensure_type("rule.description", _require(data, "description"), str),
-            source=data.get("source"),
+            why=_ensure_type("rule.why", _require(data, "why"), str),
+            source=_ensure_enum("rule.source", _require(data, "source"), allowed=["deterministic", "learner"]),
             enabled=_ensure_bool("rule.enabled", data.get("enabled", True)),
             priority=int(_ensure_number("rule.priority", _require(data, "priority"))),
             match=RuleMatch.from_dict(_ensure_dict("rule.match", _require(data, "match"))),
             actions=_parse_actions(_ensure_list("rule.actions", _require(data, "actions"))),
         )
+
+
+def _default_metadata() -> Metadata:
+    return Metadata(
+        description="Default MailAI policy",
+        owner="mailai",
+        updated_at="1970-01-01T00:00:00Z",
+    )
+
+
+def _default_schedule() -> Schedule:
+    return Schedule(learn_cron="0 3 * * *", inference_interval_s=900)
+
+
+def _default_privacy() -> PrivacyConfig:
+    return PrivacyConfig(
+        feature_store_path="/var/lib/mailai/features.db",
+        encryption=EncryptionConfig(enabled=True, key_path="/run/secrets/sqlcipher_key"),
+        hashing_pepper_path="/run/secrets/account_pepper",
+        hashing_salt_path="/run/secrets/global_hash_salt",
+        max_plaintext_window_chars=2048,
+    )
+
+
+def _default_learning() -> LearningConfig:
+    return LearningConfig(
+        enabled=True,
+        window_days=14,
+        min_samples_per_class=5,
+        llm=LLMConfig(provider="local", model="mailai-tiny", max_tokens=512, temperature=0.0),
+        embeddings=EmbeddingConfig(enabled=False, backend=None, dim=None),
+        rule_synthesis=RuleSynthesisConfig(enabled=True, max_rules_per_pass=3, require_user_confirmation=True),
+        delete_semantics=DeleteSemanticsConfig(
+            infer_meaning=True,
+            signals=["calendar_invite_past", "thread_is_resolved"],
+        ),
+    )
+
+
+def _default_defaults() -> DefaultsConfig:
+    return DefaultsConfig(case_sensitive=False, stop_on_first_match=False, dry_run=True)
+
+
+def _default_rules() -> List[Rule]:
+    baseline_match = RuleMatch(any=[{"mailbox": {"equals": "INBOX"}}], all=[], none=[])
+    baseline_rule = Rule(
+        id="baseline",
+        description="Baseline catch-all to leave messages untouched",
+        why="Ensures the engine records activity even when no automation is configured",
+        source="deterministic",
+        enabled=True,
+        priority=100,
+        match=baseline_match,
+        actions=[{"stop_processing": True}],
+    )
+    return [baseline_rule]
 
 
 @dataclass
@@ -392,6 +468,7 @@ class RulesV2:
                 "feature_store_path": self.privacy.feature_store_path,
                 "encryption": self.privacy.encryption.__dict__,
                 "hashing_pepper_path": self.privacy.hashing_pepper_path,
+                "hashing_salt_path": self.privacy.hashing_salt_path,
                 "max_plaintext_window_chars": self.privacy.max_plaintext_window_chars,
             },
             "learning": {
@@ -420,10 +497,23 @@ class RulesV2:
                         if getattr(rule.match, key)
                     },
                     "actions": rule.actions,
+                    "why": rule.why,
                 }
                 for rule in self.rules
             ],
         }
+
+    @classmethod
+    def minimal(cls) -> "RulesV2":
+        return cls(
+            version=2,
+            meta=_default_metadata(),
+            schedule=_default_schedule(),
+            privacy=_default_privacy(),
+            learning=_default_learning(),
+            defaults=_default_defaults(),
+            rules=_default_rules(),
+        )
 
 
 @dataclass
@@ -440,6 +530,13 @@ class RuleMetrics:
     matches: int
     actions: int
     errors: int
+
+
+@dataclass
+class Proposal:
+    rule_id: str
+    diff: str
+    why: str
 
 
 @dataclass
@@ -473,7 +570,7 @@ class StatusV2:
     learning: LearningMetrics
     privacy: PrivacyStatus
     notes: List[str]
-    proposals: List[Dict[str, str]]
+    proposals: List[Proposal]
 
     @classmethod
     def model_validate(cls, data: Dict[str, Any]) -> "StatusV2":
@@ -535,6 +632,17 @@ class StatusV2:
             ),
             pepper_rotation_due=_ensure_bool("privacy.pepper_rotation_due", privacy_dict.get("pepper_rotation_due", False)),
         )
+        proposals: List[Proposal] = []
+        for item in data.get("proposals", []):
+            mapping = _ensure_dict("proposals", item)
+            _ensure_keys("proposal", mapping, ["rule_id", "diff", "why"])
+            proposals.append(
+                Proposal(
+                    rule_id=_ensure_type("proposal.rule_id", _require(mapping, "rule_id"), str),
+                    diff=_ensure_type("proposal.diff", _require(mapping, "diff"), str),
+                    why=_ensure_type("proposal.why", _require(mapping, "why"), str),
+                )
+            )
         return cls(
             run_id=_ensure_type("run_id", _require(data, "run_id"), str),
             config_checksum=_ensure_type("config_checksum", _require(data, "config_checksum"), str),
@@ -547,7 +655,7 @@ class StatusV2:
             learning=learning,
             privacy=privacy,
             notes=[_ensure_type("notes", item, str) for item in data.get("notes", [])],
-            proposals=[_ensure_dict("proposals", item) for item in data.get("proposals", [])],
+            proposals=proposals,
         )
 
     def model_dump(self, mode: str = "json") -> Dict[str, Any]:
@@ -575,5 +683,46 @@ class StatusV2:
                 "pepper_rotation_due": self.privacy.pepper_rotation_due,
             },
             "notes": list(self.notes),
-            "proposals": [dict(item) for item in self.proposals],
+            "proposals": [
+                {"rule_id": item.rule_id, "diff": item.diff, "why": item.why}
+                for item in self.proposals
+            ],
         }
+
+    @classmethod
+    def minimal(cls) -> "StatusV2":
+        summary = StatusSummary(
+            scanned_messages=0,
+            matched_messages=0,
+            actions_applied=0,
+            errors=0,
+            warnings=0,
+        )
+        learning = LearningMetrics(
+            last_train_started_at=None,
+            last_train_finished_at=None,
+            samples_used=0,
+            classes=[],
+            macro_f1=None,
+            proposed_rules=0,
+            delete_semantics={},
+        )
+        privacy = PrivacyStatus(
+            feature_store_encrypted=True,
+            plaintext_leaks_detected=0,
+            pepper_rotation_due=False,
+        )
+        return cls(
+            run_id="bootstrap",
+            config_checksum="",
+            mailbox="",
+            last_run_started_at="",
+            last_run_finished_at=None,
+            mode={},
+            summary=summary,
+            by_rule={},
+            learning=learning,
+            privacy=privacy,
+            notes=[],
+            proposals=[],
+        )

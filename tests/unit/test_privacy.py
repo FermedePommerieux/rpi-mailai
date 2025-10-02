@@ -12,7 +12,7 @@ def test_encrypt_roundtrip():
 
 def test_peppered_hashing():
     pepper = b"pepper"
-    hasher = privacy.PepperHasher(pepper)
+    hasher = privacy.PepperHasher(pepper=pepper, salt=b"salt")
     tokens = ["hello", "world"]
     hashed = hasher.hash_tokens(tokens)
     assert len(hashed) == 2

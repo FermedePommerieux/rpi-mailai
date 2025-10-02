@@ -41,6 +41,7 @@ def _build_rules(stop_on_first: bool = False):
             "feature_store_path": "/tmp/features.db",
             "encryption": {"enabled": True, "key_path": "/tmp/key.bin"},
             "hashing_pepper_path": "/tmp/pepper.bin",
+            "hashing_salt_path": "/tmp/salt.bin",
             "max_plaintext_window_chars": 0,
         },
         "learning": {
@@ -70,6 +71,8 @@ def _build_rules(stop_on_first: bool = False):
             {
                 "id": "rule1",
                 "description": "mark updates",
+                "why": "Ensures weekly update threads are prioritised",
+                "source": "deterministic",
                 "priority": 5,
                 "enabled": True,
                 "match": {
@@ -89,6 +92,8 @@ def _build_rules(stop_on_first: bool = False):
             {
                 "id": "rule2",
                 "description": "fallback",
+                "why": "Catch unmatched updates for auditing",
+                "source": "deterministic",
                 "priority": 10,
                 "enabled": True,
                 "match": {"any": [{"subject": {"contains": "update"}}]},

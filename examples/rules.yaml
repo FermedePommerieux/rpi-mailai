@@ -1,31 +1,32 @@
 version: 2
 meta:
-  description: "Default MailAI configuration"
-  owner: "operator@example.com"
-  updated_at: "2025-01-01T00:00:00+00:00"
+  description: "Household triage policy for the Doe family"
+  owner: "doe@example.net"
+  updated_at: "2025-02-12T08:00:00Z"
 schedule:
   learn_cron: "30 2 * * *"
-  inference_interval_s: 60
+  inference_interval_s: 180
 privacy:
   feature_store_path: "/var/lib/mailai/features.db"
   encryption:
     enabled: true
-    key_path: "/etc/mailai/key.bin"
-  hashing_pepper_path: "/etc/mailai/pepper.bin"
-  max_plaintext_window_chars: 0
+    key_path: "/run/secrets/sqlcipher_key"
+  hashing_pepper_path: "/run/secrets/account_pepper"
+  hashing_salt_path: "/run/secrets/global_hash_salt"
+  max_plaintext_window_chars: 1536
 learning:
   enabled: true
-  window_days: 60
-  min_samples_per_class: 20
+  window_days: 30
+  min_samples_per_class: 10
   llm:
     provider: "llama.cpp"
     model: "qwen2.5-3b-instruct-q4_0.gguf"
-    max_tokens: 128
-    temperature: 0.2
+    max_tokens: 256
+    temperature: 0.0
   embeddings:
-    enabled: true
-    backend: "gguf-emb"
-    dim: 384
+    enabled: false
+    backend: null
+    dim: null
   rule_synthesis:
     enabled: true
     max_rules_per_pass: 3
@@ -33,25 +34,44 @@ learning:
   delete_semantics:
     infer_meaning: true
     signals:
-      - "thread_is_resolved"
-      - "list_unsubscribe_present"
-      - "age_gt_days:14"
+      - "calendar_invite_past"
+      - "conversation_closed"
+      - "spam_score_high"
 defaults:
   case_sensitive: false
   stop_on_first_match: false
-  dry_run: false
+  dry_run: true
 rules:
-  - id: move-newsletters
-    description: "Move newsletters to dedicated folder"
+  - id: newsletters
+    description: "Sweep recurring newsletters into the reading list"
+    why: "Keeps marketing material out of the primary inbox while remaining accessible"
+    source: deterministic
+    enabled: true
     priority: 10
     match:
       any:
         - header:
             name: "List-Id"
-            contains: "."
+            contains: "newsletter"
         - subject:
             contains: "newsletter"
     actions:
-      - add_label: "Newsletters"
-      - move_to: "INBOX/Newsletters"
-      - mark_read: true
+      - add_label: "Reading/Newsletters"
+      - move_to: "Reading/Newsletters"
+  - id: family-updates
+    description: "Highlight direct family messages"
+    why: "Ensures important family discussions stay visible"
+    source: deterministic
+    enabled: true
+    priority: 5
+    match:
+      all:
+        - from:
+            contains: "@family.example.net"
+      none:
+        - mailbox:
+            equals: "Reading/Newsletters"
+    actions:
+      - add_label: "Priority/Family"
+      - mark_read: false
+      - stop_processing: true

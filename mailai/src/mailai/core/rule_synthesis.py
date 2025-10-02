@@ -11,6 +11,7 @@ class RuleCandidate:
 
     id: str
     description: str
+    why: str
     match: Dict[str, object]
     actions: List[Dict[str, object]]
     source: str = "learner"
@@ -25,10 +26,12 @@ def synthesise_rules(weights: Dict[str, float], glossary: Dict[str, str], k_max:
     candidates: List[RuleCandidate] = []
     for idx, (feature, weight) in enumerate(top_items, start=1):
         description = f"Model-derived rule for feature {feature}"
+        why = "Automated learner suggested this rule based on consistent gestures"
         mailbox = glossary.get(feature, "INBOX")
         candidate = RuleCandidate(
             id=f"auto-{idx}",
             description=description,
+            why=why,
             match={
                 "any": [
                     {"category_pred": {"equals": mailbox, "prob_gte": 0.85}},

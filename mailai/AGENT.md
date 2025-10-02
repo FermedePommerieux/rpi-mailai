@@ -23,3 +23,33 @@ Threat modelling quick-reference:
    editing those modules.
 3. Differential privacy layers must never leak counts for fewer than five
    samples even after noise injection.
+
+## Operational flows
+
+- `mailai once`: run a single inference pass against the selected account. The
+  agent mounts the `MailIA/` control mailbox, restores missing configuration if
+  required, and emits a fresh `status.yaml` snapshot in dry-run mode by default.
+- `mailai watch`: identical to `once` but loops according to the configured
+  `schedule.inference_interval_s`. Auto-repair logic for `rules.yaml` is invoked
+  on every cycle before processing user messages.
+- `mailai learn-now`: execute the training pipeline immediately. The learner may
+  populate the `proposals` section of `status.yaml` with candidate rules which
+  are disabled by default (`enabled: false`, `source: learner`).
+
+## Gesture interpretation
+
+- **move** gestures are treated as explicit, high-confidence labels. When the
+  learner sees repeated manual moves, it synthesises candidate rules with
+  `why` explaining the automation intent.
+- **delete** gestures feed into heuristics in `core/delete_semantics.py`. Signals
+  such as `spam_score_high`, `promotion_sender`, `conversation_closed`, and
+  `invite_expired` are mapped to interpretable reasons so the user understands
+  why MailAI suggests archival or deletion.
+
+## Rule proposals
+
+Learner-generated rules are serialised into the `proposals` array inside
+`status.yaml` as YAML diffs alongside a human-readable justification. Only the
+top-N proposals are retained when the status document would exceed the 64 KB
+soft limit, and the originals remain disabled until the operator promotes them
+into `rules.yaml`.

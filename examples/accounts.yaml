@@ -1,0 +1,28 @@
+# Example accountctl export with Docker secrets references
+accounts:
+  - name: "personal"
+    imap:
+      host: "imap.example.net"
+      port: 993
+      ssl: true
+      username: "doe@example.net"
+      password_file: "/run/secrets/personal_imap_password"
+      control_namespace: "MailIA"
+      quarantine_subfolder: "Quarantine"
+    secrets:
+      hash_salt: "/run/secrets/global_hash_salt"
+      pepper: "/run/secrets/personal_pepper"
+      sqlcipher_key: "/run/secrets/sqlcipher_key"
+  - name: "work"
+    imap:
+      host: "mail.corp.example"
+      port: 993
+      ssl: true
+      username: "doe@example.com"
+      password_file: "/run/secrets/work_imap_password"
+      control_namespace: "MailIA"
+      quarantine_subfolder: "Quarantine"
+    secrets:
+      hash_salt: "/run/secrets/global_hash_salt"
+      pepper: "/run/secrets/work_pepper"
+      sqlcipher_key: "/run/secrets/sqlcipher_key"
