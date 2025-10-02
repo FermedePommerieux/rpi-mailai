@@ -76,6 +76,10 @@ docker exec -it rpi-mailai python /app/mailai.py --config /config/config.yml pre
 
 The `loop` command now refreshes the snapshot, applies predictions restricted to the INBOX, and triggers a retraining pass at least once every 24 hours to incorporate user corrections (moves, deletions) automatically.
 
+### Configuration note
+
+Ensure `config/config.yml` defines a `hash_salt` entry (any sufficiently random string). The salt is combined with the account name to derive anonymised SHA-256 keys for message tracking, so changing it will alter the identifiers stored in SQLite.
+
 ## Inspect database stats
 
 Aggregate ingestion metrics (total mails, labeled share and decision distribution) per account directly from SQLite:
