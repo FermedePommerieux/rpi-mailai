@@ -119,7 +119,7 @@ def _load_settings():
         raise SystemExit(f"unable to load runtime config: {exc}") from exc
 
     llm_cfg = runtime.llm
-    model_path = os.environ.get("LLM_MODEL_PATH", llm_cfg.model_path)
+    model_path = os.environ.get("LLM_MODEL_PATH") or llm_cfg.model_path
     if not model_path:
         raise SystemExit("LLM_MODEL_PATH is not set")
     model_file = Path(model_path)
@@ -128,7 +128,7 @@ def _load_settings():
 
     threads = _int_from_env("LLM_N_THREADS", llm_cfg.threads)
     ctx_size = _int_from_env("LLM_CTX_SIZE", llm_cfg.ctx_size)
-    sentinel_path = Path(os.environ.get("LLM_HEALTH_SENTINEL", llm_cfg.sentinel_path))
+    sentinel_path = Path(os.environ.get("LLM_HEALTH_SENTINEL") or llm_cfg.sentinel_path)
     load_timeout_s = _int_from_env("LLM_LOAD_TIMEOUT_S", llm_cfg.load_timeout_s)
     completion_timeout_s = _int_from_env(
         "LLM_WARMUP_COMPLETION_TIMEOUT_S", llm_cfg.warmup_completion_timeout_s
@@ -294,10 +294,10 @@ PY
 }
 
 MAILAI_VALIDATE=${MAILAI_VALIDATE:-0}
-LLM_MODEL_PATH=${LLM_MODEL_PATH:-}
-LLM_N_THREADS=${LLM_N_THREADS:-3}
-LLM_CTX_SIZE=${LLM_CTX_SIZE:-2048}
-LLM_HEALTH_SENTINEL=${LLM_HEALTH_SENTINEL:-/var/lib/mailai/.cache/llm_ready.json}
+: "${LLM_MODEL_PATH:=}"
+: "${LLM_N_THREADS:=}"
+: "${LLM_CTX_SIZE:=}"
+: "${LLM_HEALTH_SENTINEL:=}"
 export LLM_MODEL_PATH LLM_N_THREADS LLM_CTX_SIZE MAILAI_VALIDATE
 export LLM_HEALTH_SENTINEL
 
@@ -307,10 +307,7 @@ require_dir /models ro
 
 check_secrets
 
-if [ -z "$LLM_MODEL_PATH" ]; then
-    fail "LLM_MODEL_PATH is required"
-fi
-if [ ! -f "$LLM_MODEL_PATH" ]; then
+if [ -n "$LLM_MODEL_PATH" ] && [ ! -f "$LLM_MODEL_PATH" ]; then
     fail "LLM model file $LLM_MODEL_PATH not found"
 fi
 
