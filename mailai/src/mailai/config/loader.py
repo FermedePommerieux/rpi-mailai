@@ -1,4 +1,42 @@
-"""Utilities for loading MailAI configuration documents."""
+"""Strict loaders and serializers for MailAI configuration documents.
+
+What:
+  Provide helpers to locate, parse, validate, and serialise the runtime
+  configuration files (``config.cfg``, ``rules.yaml``, ``status.yaml``).
+
+Why:
+  Configuration lives outside the application bundle and can be malformed or
+  tampered with. Centralising the parsing logic enforces consistent validation
+  and hashing so that downstream services can trust the resulting models.
+
+How:
+  Resolve candidate file locations based on explicit parameters, environment
+  variables, and defaults. Parse JSON/YAML payloads through the local YAML shim,
+  validate them using Pydantic models, and expose deterministic hashing to track
+  changes across IMAP synchronisation cycles.
+
+Interfaces:
+  - :func:`load_runtime_config` / :func:`get_runtime_config` /
+    :func:`reset_runtime_config`: Manage ``config.cfg`` discovery and caching.
+  - :func:`load_rules` / :func:`load_status`: Parse YAML payloads embedded in
+    IMAP messages into typed models.
+  - :func:`dump_rules` / :func:`dump_status`: Serialise typed models back into
+    YAML bytes for persistence.
+  - :class:`LoadedDocument`: Bundle parsed models with their raw text and
+    checksums for auditability.
+
+Invariants:
+  - All external payloads must pass strict Pydantic validation before they are
+    returned to callers.
+  - The runtime configuration cache respects explicit reload requests and the
+    precedence order of candidate paths.
+
+Safety/Performance:
+  - Hash computations use SHA-256 to uniquely identify IMAP payload revisions
+    without storing plaintext beyond the minimal processing window.
+  - File operations avoid silent failures by converting OS errors into typed
+    exceptions that include path context.
+"""
 
 from __future__ import annotations
 
@@ -21,20 +59,77 @@ from .schema import (
 
 
 class ConfigLoadError(Exception):
-    """Raised when configuration parsing or validation fails."""
+    """Base error for configuration parsing or validation failures.
+
+    What:
+      Represent fatal issues encountered while reading or validating
+      configuration documents.
+
+    Why:
+      Grouping failures under a single type allows callers to handle user input
+      mistakes separately from infrastructure errors such as IMAP connectivity
+      problems.
+
+    How:
+      Derive from :class:`Exception` and rely on callers to include contextual
+      messages describing the failing document.
+    """
 
 
 class RuntimeConfigError(ConfigLoadError):
-    """Raised when the runtime configuration cannot be loaded."""
+    """Error raised when ``config.cfg`` cannot be loaded or validated.
+
+    What:
+      Signal issues related specifically to runtime configuration discovery or
+      schema validation.
+
+    Why:
+      Differentiating runtime configuration failures helps CLI tools display
+      targeted remediation steps without conflating them with rules/status
+      parsing issues.
+
+    How:
+      Subclass :class:`ConfigLoadError` so upstream handlers can catch the broad
+      category or the specialised variant as needed.
+    """
 
 
 class YamlValidationError(ConfigLoadError):
-    """Backward compatible alias for :class:`ConfigLoadError`."""
+    """Backward-compatible alias for :class:`ConfigLoadError`.
+
+    What:
+      Preserve the historical exception name used by earlier releases.
+
+    Why:
+      Existing automation and tests expect this symbol; keeping it avoids a
+      breaking change while forwarding to the new hierarchy.
+
+    How:
+      Inherit directly from :class:`ConfigLoadError` without adding behaviour.
+    """
 
 
 @dataclass
 class LoadedDocument:
-    """Wrapper containing both the parsed model and raw YAML text."""
+    """Bundle parsed configuration models with their raw representation.
+
+    What:
+      Provide a structured return type that includes the Pydantic model, the raw
+      textual payload, and a checksum capturing its contents.
+
+    Why:
+      Downstream components (such as IMAP sync and auditing) need both the typed
+      data and the exact bytes to detect tampering or reconstruct emails.
+
+    How:
+      Store the fields as dataclass attributes so callers can access them
+      directly without extra wrappers.
+
+    Attributes:
+      model: The validated Pydantic model.
+      raw: The canonical text representation of the payload.
+      checksum: SHA-256 checksum prefixed with ``sha256:`` for log correlation.
+    """
 
     model: Any
     raw: str
@@ -51,6 +146,30 @@ _RUNTIME_CACHE: Optional[Tuple[Path, RuntimeConfig]] = None
 
 
 def _candidate_paths(path: Optional[Path]) -> Iterable[Path]:
+    """Yield configuration file locations in priority order.
+
+    What:
+      Produce the ordered list of paths that should be inspected for
+      ``config.cfg``.
+
+    Why:
+      The runtime allows operators to override the configuration path through a
+      function argument, environment variable, or well-known defaults; this
+      helper captures that precedence chain.
+
+    How:
+      Accumulate deduplicated :class:`~pathlib.Path` objects by checking the
+      explicit argument, the ``MAILAI_CONFIG_PATH`` environment variable, and the
+      default locations. Paths are expanded to handle ``~`` resolutions.
+
+    Args:
+      path: Explicit path requested by the caller, or ``None`` to rely on
+        environment/defaults.
+
+    Yields:
+      Candidate paths ordered from most specific to least specific.
+    """
+
     seen: set[Path] = set()
     if path is not None:
         candidate = path.expanduser()
@@ -65,12 +184,39 @@ def _candidate_paths(path: Optional[Path]) -> Iterable[Path]:
             yield candidate
     for default in _DEFAULT_LOCATIONS:
         candidate = default.expanduser()
+        # NOTE: Deduplicate while preserving the user-visible precedence order.
         if candidate not in seen:
             seen.add(candidate)
             yield candidate
 
 
 def _parse_config_payload(text: str, source: Path) -> dict[str, Any]:
+    """Parse ``config.cfg`` text into a dictionary payload.
+
+    What:
+      Convert raw configuration text to a Python mapping ready for validation.
+
+    Why:
+      ``config.cfg`` may be JSON or YAML depending on operator preference. This
+      helper abstracts the parsing logic while providing precise error messages.
+
+    How:
+      Detect JSON either by file suffix or leading ``{``, otherwise delegate to
+      the YAML shim. Wrap decoding errors in :class:`RuntimeConfigError` to
+      include filename context, and verify the top-level structure is a mapping.
+
+    Args:
+      text: Raw configuration contents.
+      source: Path to the file being parsed (used for diagnostics).
+
+    Returns:
+      A dictionary representing the configuration payload.
+
+    Raises:
+      RuntimeConfigError: If the file cannot be parsed or does not contain a
+      mapping.
+    """
+
     stripped = text.lstrip()
     if source.suffix.lower() == ".json" or stripped.startswith("{"):
         try:
@@ -88,6 +234,32 @@ def _parse_config_payload(text: str, source: Path) -> dict[str, Any]:
 
 
 def _load_runtime_from_path(path: Path) -> RuntimeConfig:
+    """Load and validate ``config.cfg`` from a specific path.
+
+    What:
+      Read the file at ``path`` and convert it into a validated
+      :class:`RuntimeConfig` model.
+
+    Why:
+      Splitting the functionality keeps :func:`load_runtime_config` focused on
+      path discovery while this helper handles IO and schema validation.
+
+    How:
+      Read the file contents, parse them via :func:`_parse_config_payload`, and
+      validate using :meth:`RuntimeConfig.model_validate`. Wrap filesystem or
+      validation failures in :class:`RuntimeConfigError` with descriptive
+      messages.
+
+    Args:
+      path: Filesystem location of the runtime configuration.
+
+    Returns:
+      The validated :class:`RuntimeConfig` model.
+
+    Raises:
+      RuntimeConfigError: If the file cannot be read or fails validation.
+    """
+
     try:
         text = path.read_text()
     except FileNotFoundError as exc:
@@ -106,7 +278,33 @@ def load_runtime_config(
     *,
     reload: bool = False,
 ) -> RuntimeConfig:
-    """Load the runtime configuration from ``config.cfg``."""
+    """Resolve, parse, and cache the runtime configuration.
+
+    What:
+      Locate ``config.cfg`` using the configured precedence chain, parse it, and
+      return a validated :class:`RuntimeConfig` instance.
+
+    Why:
+      Many components require runtime settings; caching avoids repeated disk IO
+      while ``reload`` enables deterministic refreshes during tests or config
+      changes.
+
+    How:
+      Convert string paths to :class:`~pathlib.Path`, consult the global cache
+      unless ``reload`` is requested, iterate through candidate paths until a
+      readable file is found, and store the successful result for future calls.
+
+    Args:
+      path: Optional explicit location of ``config.cfg``.
+      reload: When ``True`` forces a fresh load bypassing the cache.
+
+    Returns:
+      The validated runtime configuration.
+
+    Raises:
+      RuntimeConfigError: If no suitable configuration file can be located or
+      validated.
+    """
 
     global _RUNTIME_CACHE
 
@@ -130,20 +328,70 @@ def load_runtime_config(
 
 
 def get_runtime_config() -> RuntimeConfig:
-    """Return the cached runtime configuration, loading it if required."""
+    """Return the cached runtime configuration, loading it on demand.
+
+    What:
+      Provide a convenience accessor for callers that do not care about cache
+      invalidation semantics.
+
+    Why:
+      Simplifies call sites by delegating to :func:`load_runtime_config` with the
+      default caching behaviour.
+
+    How:
+      Call :func:`load_runtime_config` without arguments and return its result.
+
+    Returns:
+      The validated runtime configuration.
+    """
 
     return load_runtime_config()
 
 
 def reset_runtime_config() -> None:
-    """Clear the runtime configuration cache (useful in tests)."""
+    """Clear the runtime configuration cache.
+
+    What:
+      Reset the memoised tuple storing the last loaded configuration.
+
+    Why:
+      Test suites and long-running processes need deterministic ways to force a
+      reload when configuration files change.
+
+    How:
+      Assign ``None`` to the module-level ``_RUNTIME_CACHE`` variable.
+    """
 
     global _RUNTIME_CACHE
     _RUNTIME_CACHE = None
 
 
 def parse_and_validate(yaml_text: str) -> RulesV2:
-    """Parse and validate a rules YAML document returning the pydantic model."""
+    """Convert rules YAML into a validated :class:`RulesV2` model.
+
+    What:
+      Decode YAML text, ensure it produces a mapping, and validate it using the
+      strict schema.
+
+    Why:
+      The rules document originates from user-maintained email bodies; the engine
+      must guard against malformed or malicious payloads before applying actions
+      to messages.
+
+    How:
+      Delegate to the YAML shim for parsing, assert the result is a dictionary,
+      and feed it into :meth:`RulesV2.model_validate`, wrapping validation errors
+      in :class:`ConfigLoadError` for uniform handling.
+
+    Args:
+      yaml_text: Raw ``rules.yaml`` contents in UTF-8 text form.
+
+    Returns:
+      A validated :class:`RulesV2` model.
+
+    Raises:
+      ConfigLoadError: If parsing fails or the document violates the schema.
+    """
 
     try:
         payload = yamlshim.load(yaml_text.encode("utf-8")) or {}
@@ -158,12 +406,52 @@ def parse_and_validate(yaml_text: str) -> RulesV2:
 
 
 def _checksum(text: str) -> str:
+    """Return a stable SHA-256 checksum prefixing the digest with ``sha256:``.
+
+    What:
+      Provide a deterministic identifier for the supplied text.
+
+    Why:
+      The IMAP synchronisation pipeline compares checksums to detect content
+      changes without storing plaintext snapshots.
+
+    How:
+      Hash the UTF-8 encoding of ``text`` using :func:`hashlib.sha256` and format
+      the digest according to repository conventions.
+
+    Args:
+      text: The string to hash.
+
+    Returns:
+      A checksum string of the form ``sha256:<hex>``.
+    """
+
     digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
     return f"sha256:{digest}"
 
 
 def load_rules(source: bytes) -> LoadedDocument:
-    """Load a rules document from bytes and validate it."""
+    """Parse and validate a ``rules.yaml`` payload provided as bytes.
+
+    What:
+      Convert the given bytes to text, validate via :func:`parse_and_validate`,
+      and package the result alongside the original text and checksum.
+
+    Why:
+      IMAP downloads deliver raw bytes; higher-level services need a consistent
+      entry point to obtain validated models and metadata.
+
+    How:
+      Decode using UTF-8, validate, compute the checksum, and return a
+      :class:`LoadedDocument` dataclass instance.
+
+    Args:
+      source: Raw bytes of the YAML document.
+
+    Returns:
+      A :class:`LoadedDocument` containing the model, canonical text, and
+      checksum.
+    """
 
     text = source.decode("utf-8")
     model = parse_and_validate(text)
@@ -171,7 +459,30 @@ def load_rules(source: bytes) -> LoadedDocument:
 
 
 def load_status(source: bytes) -> LoadedDocument:
-    """Load and validate a status document."""
+    """Parse and validate a ``status.yaml`` payload provided as bytes.
+
+    What:
+      Transform the status document into a :class:`StatusV2` model while
+      preserving a canonical text representation for auditing.
+
+    Why:
+      Status emails track runtime activity; ensuring they conform to the schema
+      prevents dashboards from operating on inconsistent data.
+
+    How:
+      Parse YAML via the shim, validate through :class:`StatusV2`, serialise the
+      validated model back to canonical YAML, and return it wrapped in
+      :class:`LoadedDocument` with its checksum.
+
+    Args:
+      source: Raw bytes containing the YAML document.
+
+    Returns:
+      A :class:`LoadedDocument` representing the validated status payload.
+
+    Raises:
+      ConfigLoadError: If parsing or validation fails.
+    """
 
     try:
         payload = yamlshim.load(source) or {}
@@ -188,12 +499,53 @@ def load_status(source: bytes) -> LoadedDocument:
 
 
 def dump_rules(model: RulesV2) -> bytes:
-    """Serialise a rules model back into YAML bytes."""
+    """Serialise a :class:`RulesV2` model into canonical YAML bytes.
+
+    What:
+      Convert the validated rules model into a YAML payload suitable for
+      persistence.
+
+    Why:
+      Ensures backups and IMAP uploads use a consistent representation that is
+      stable across runs for diffing.
+
+    How:
+      Dump the model using ``mode="json"`` to obtain a serialisable dictionary
+      and feed it to the YAML shim before encoding to UTF-8 bytes.
+
+    Args:
+      model: Validated rules configuration.
+
+    Returns:
+      Canonical YAML bytes representing the rules.
+    """
 
     return yamlshim.dump(model.model_dump(mode="json")).encode("utf-8")
 
 
 def dump_status(model: StatusV2) -> bytes:
-    """Serialise a status model back into YAML bytes."""
+    """Serialise a :class:`StatusV2` model into canonical YAML bytes.
+
+    What:
+      Produce a YAML representation of the status snapshot suitable for storage
+      or transmission.
+
+    Why:
+      Maintaining canonical formatting ensures status comparisons and backups are
+      deterministic.
+
+    How:
+      Mirror :func:`dump_rules` by dumping the Pydantic model with
+      ``mode="json"`` before YAML serialisation and UTF-8 encoding.
+
+    Args:
+      model: Validated status snapshot.
+
+    Returns:
+      Canonical YAML bytes representing the status payload.
+    """
 
     return yamlshim.dump(model.model_dump(mode="json")).encode("utf-8")
+
+
+# TODO: Other modules require the same treatment (Quoi/Pourquoi/Comment docstrings + module header).

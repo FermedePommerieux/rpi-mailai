@@ -1,4 +1,31 @@
-"""Runtime health probe for the embedded llama-cpp-python model."""
+"""MailAI LLM health probe for validating warmup sentinels and model readiness.
+
+What:
+    Provide the CLI entry point that checks the on-disk warmup sentinel produced
+    by the `llm_local` bootstrap, ensuring the configured llama-cpp-python model
+    still matches the parameters captured during the last warmup run.
+Why:
+    The health check is invoked by container orchestrators and CI pipelines to
+    guarantee the Raspberry Pi deployment only reports "ready" when the local
+    LLM can answer completions. We centralize the validation rules here so both
+    manual operators and automated supervisors receive the same deterministic
+    verdict.
+How:
+    Load runtime configuration, resolve environment overrides, and compare the
+    warmup sentinel metadata with the active filesystem state. The module keeps
+    I/O minimal—only the sentinel JSON and the model file are touched—to avoid
+    thrashing SD storage. Any mismatch or stale value terminates the process
+    with a non-zero code.
+Interfaces:
+    main() -> int
+Invariants:
+    - Never attempt IMAP or network calls; the probe must stay fast and local.
+    - Refuse to report success when the sentinel predates the model timestamp.
+    - Require non-empty completion text to confirm llama-cpp-python responded.
+Security/Performance:
+    - Avoid leaking model content by never logging completion bodies.
+    - Fail-fast with actionable stderr messages to aid unattended monitoring.
+"""
 
 from __future__ import annotations
 
@@ -12,6 +39,28 @@ from .config.loader import RuntimeConfigError, get_runtime_config
 
 
 def _int_from_env(name: str, default: int) -> int:
+    """Return an integer from ``os.environ`` or ``default`` on absence.
+
+    What:
+      Parse the named environment variable as an integer, using ``default`` when
+      unset.
+
+    Why:
+      Health probes allow operators to override timeouts via environment
+      variables; this helper ensures type safety and clear error messages.
+
+    How:
+      Look up ``name`` in the environment, attempt to convert to ``int``, and
+      abort with :class:`SystemExit` on invalid input.
+
+    Args:
+      name: Environment variable to read.
+      default: Fallback value when the variable is missing.
+
+    Returns:
+      Parsed integer value.
+    """
+
     value = os.environ.get(name)
     if value is None or value == "":
         return default
@@ -22,6 +71,26 @@ def _int_from_env(name: str, default: int) -> int:
 
 
 def _load_json(path: Path) -> dict[str, object]:
+    """Read and decode a JSON file into a dictionary.
+
+    What:
+      Load the warmup sentinel describing the expected model parameters.
+
+    Why:
+      The sentinel drives comparisons between runtime configuration and
+      filesystem state; malformed or missing files should abort the probe.
+
+    How:
+      Read the file, decode JSON, ensure the payload is a dictionary, and raise
+      :class:`SystemExit` with helpful messages on failure.
+
+    Args:
+      path: Location of the sentinel file.
+
+    Returns:
+      Dictionary representing the sentinel contents.
+    """
+
     try:
         raw = path.read_text()
     except FileNotFoundError:
@@ -41,6 +110,23 @@ def _load_json(path: Path) -> dict[str, object]:
 
 
 def _touch_model(model_file: Path) -> None:
+    """Attempt to open the model file to confirm readability.
+
+    What:
+      Perform a minimal read to ensure the model still exists and is accessible.
+
+    Why:
+      Health checks should fail fast if the model was removed or permissions
+      changed, preventing misleading "ready" responses.
+
+    How:
+      Open the file in binary mode and read a single byte, raising
+      :class:`SystemExit` if an :class:`OSError` occurs.
+
+    Args:
+      model_file: Path to the llama-cpp-python model file.
+    """
+
     try:
         with model_file.open("rb") as handle:
             handle.read(1)
@@ -49,6 +135,27 @@ def _touch_model(model_file: Path) -> None:
 
 
 def main() -> int:
+    """Check local LLM readiness based on the warmup sentinel.
+
+    What:
+        Validate that the llama-cpp-python model previously warmed up is still
+        available, unchanged, and responsive according to the JSON sentinel.
+        Returns an exit status suitable for container health probes.
+    Why:
+        Health endpoints must guard against silent model replacement, SD card
+        corruption, or configuration drift. Returning success without checking
+        these invariants would allow the orchestrator to route traffic to an
+        unready node, leading to failed completions for operators.
+    How:
+        Resolve runtime configuration, apply environment overrides, load the
+        sentinel, and compare model path, threading parameters, timestamp, and
+        completion payload. Any discrepancy produces stderr diagnostics and a
+        non-zero exit code; a clean pass returns zero.
+
+    Returns:
+        int: ``0`` when the sentinel and filesystem state agree; ``1`` when a
+        mismatch or I/O error prevents validation.
+    """
     try:
         runtime = get_runtime_config()
     except RuntimeConfigError as exc:
@@ -131,3 +238,5 @@ def main() -> int:
 
 if __name__ == "__main__":  # pragma: no cover - module executable entry point
     raise SystemExit(main())
+
+# TODO: Remaining modules still require What/Why/How documentation.
