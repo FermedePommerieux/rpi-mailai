@@ -119,12 +119,13 @@ dedicated control namespace. By default the agent reuses the standard `Drafts`
 mailbox that contains two human-readable messages:
 
 - **`MailAI: rules.yaml`** – the authoritative configuration described by the
-  [`RulesV2`](mailai/src/mailai/config/schema.py) schema. Every rule must include
-  a human-facing `description`, a justification in `why`, and a `source`
-  indicating whether the rule was `deterministic` or emitted by the
-  `learner`. The agent automatically restores a minimal rule-set if the file is
-  missing or becomes corrupted and keeps a mirror copy as
-  `MailAI: rules.bak.yaml`.
+  [`RulesV2`](mailai/src/mailai/config/schema.py) schema. The IMAP message now
+  exposes only the `rules` list; defaults for scheduling, privacy, and learning
+  are rehydrated from the built-in baseline at load time. Every rule must
+  include a human-facing `description`, a justification in `why`, and a `source`
+  indicating whether the rule was `deterministic` or emitted by the `learner`.
+  The agent automatically restores a minimal rule-set if the file is missing or
+  becomes corrupted and keeps a mirror copy as `MailAI: rules.bak.yaml`.
 - **`MailAI: status.yaml`** – the latest diagnostic snapshot following the
   [`StatusV2`](mailai/src/mailai/config/schema.py) schema. It records aggregate
   metrics, privacy checks, and a `proposals` section where learner-generated

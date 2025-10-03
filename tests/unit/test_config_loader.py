@@ -33,27 +33,31 @@ import pytest
 from mailai.config.loader import (
     ConfigLoadError,
     RuntimeConfigError,
+    dump_rules,
     get_runtime_config,
     load_runtime_config,
     parse_and_validate,
     reset_runtime_config,
 )
+from mailai.config.schema import RulesV2
 
 
 def test_parse_and_validate_roundtrip():
-    """ 
+    """
     What:
-        Confirm that a valid YAML rules payload round-trips through the parser
+        Confirm that a rules-only YAML payload round-trips through the parser
         into a strongly typed configuration model.
 
     Why:
         The runtime relies on schema validation to prevent partial rule sets or
-        stale versions from entering the system; this guard catches regression in
-        that validation layer.
+        stale versions from entering the system; this guard catches regressions in
+        the hydration logic that restores defaults when only ``rules`` are
+        provided.
 
     How:
         Load the canonical example rules file, parse it via ``parse_and_validate``,
-        and assert key schema attributes such as version and non-empty rule list.
+        and assert key schema attributes such as version, default hydration, and a
+        non-empty rule list.
 
     Returns:
         None
@@ -62,6 +66,7 @@ def test_parse_and_validate_roundtrip():
     model = parse_and_validate(text)
     assert model.version == 2
     assert model.rules
+    assert model.defaults.dry_run is True
 
 
 def test_invalid_rules_raise_config_load_error():
@@ -85,6 +90,29 @@ def test_invalid_rules_raise_config_load_error():
     """
     with pytest.raises(ConfigLoadError):
         parse_and_validate("version: 1")
+
+
+def test_dump_rules_emits_rules_only():
+    """Validate that ``dump_rules`` hides internal defaults from operators.
+
+    What:
+        Ensure the serialised YAML contains only the ``rules`` list.
+
+    Why:
+        The Drafts control message must not leak baseline defaults that could
+        confuse operators or be edited incorrectly.
+
+    How:
+        Call :func:`dump_rules` on :meth:`RulesV2.minimal`, decode the bytes, and
+        assert the payload matches the expected keys.
+
+    Returns:
+        None
+    """
+
+    rendered = dump_rules(RulesV2.minimal()).decode("utf-8")
+    assert rendered.strip().startswith("rules:")
+    assert "meta:" not in rendered
 
 
 def test_load_runtime_config_from_yaml(tmp_path, monkeypatch):
