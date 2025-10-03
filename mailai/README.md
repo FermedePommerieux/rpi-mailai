@@ -56,6 +56,24 @@ deployments search the current working directory first and fall back to
 `/etc/mailai/config.cfg` and `/var/lib/mailai/config.cfg`. A reference document
 is available under [`examples/config.cfg`](../examples/config.cfg).
 
+### LLM warm-up and healthcheck timeouts
+
+The `llm` section of `config.cfg` controls how the embedded llama.cpp runtime is
+initialised. In addition to the model location and threading parameters, three
+timeouts guard the warm-up and healthcheck sequence:
+
+- `load_timeout_s` (default **120s**) – caps how long the GGUF model may take to
+  load during start-up before MailAI aborts the attempt.
+- `warmup_completion_timeout_s` (default **10s**) – limits the inference window
+  for the warm-up completion that verifies the model can answer a trivial
+  prompt.
+- `healthcheck_timeout_s` (default **5s**) – bounds the execution time for the
+  `mailai-health-llm` probe that revalidates the warm-up sentinel.
+
+Increase these values when running larger models or slower storage where the
+initial load might exceed the defaults. The sample configuration documents
+recommended overrides for Raspberry Pi deployments.
+
 ## IMAP YAML Configuration
 
 MailAI stores its configuration and diagnostics inside the IMAP account under a

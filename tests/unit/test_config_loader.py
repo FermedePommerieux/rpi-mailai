@@ -73,6 +73,8 @@ feedback:
     assert runtime.imap.default_mailbox == "Primary"
     assert runtime.llm.model_path == "/models/llm.gguf"
     assert runtime.llm.load_timeout_s == 180
+    assert runtime.llm.warmup_completion_timeout_s == 20
+    assert runtime.llm.healthcheck_timeout_s == 15
 
 
 def test_load_runtime_config_from_json(tmp_path, monkeypatch):
@@ -119,6 +121,8 @@ def test_load_runtime_config_from_json(tmp_path, monkeypatch):
     runtime = load_runtime_config()
     assert runtime.llm.threads == 2
     assert runtime.mail.rules.limits.hard_limit == 20
+    assert runtime.llm.load_timeout_s == 90
+    assert runtime.llm.warmup_completion_timeout_s == 12
     assert runtime.llm.healthcheck_timeout_s == 8
 
 
