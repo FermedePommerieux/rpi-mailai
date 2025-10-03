@@ -21,14 +21,14 @@ Interfaces:
     in-memory models.
   - load_status / dump_status: Manage the ``status.yaml`` runtime document.
   - get_runtime_config / load_runtime_config / reset_runtime_config: Resolve
-    ``config.cfg`` and expose a cached runtime configuration object.
+    ``config.yaml`` and expose a cached runtime configuration object.
   - RulesV2 / RuntimeConfig / StatusV2 / ValidationError: Pydantic models and
     error type used by the higher-level services.
 
 Invariants:
   - Only the documented helpers are reachable through the package namespace.
   - Callers must go through the schema types to ensure strict validation before
-    touching user-provided YAML/JSON payloads.
+    touching user-provided YAML payloads.
 
 Safety/Performance:
   - Explicit exports minimise import cost on constrained Raspberry Pi systems

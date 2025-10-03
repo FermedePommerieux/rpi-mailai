@@ -46,8 +46,8 @@ and never persists cleartext email data.
 
 ## Global runtime configuration
 
-MailAI centralises all runtime tunables inside a single `config.cfg` file. The
-loader accepts either YAML or JSON and validates the payload against the
+MailAI centralises all runtime tunables inside a single `config.yaml` file. The
+loader accepts strict YAML and validates the payload against the
 [`RuntimeConfig`](mailai/src/mailai/config/schema.py) schema. Typical settings
 include IMAP defaults (control namespace, quarantine folder, configuration
 subjects), size limits for the control mails, filesystem paths for state and
@@ -55,14 +55,14 @@ models, local LLM parameters, optional feedback mailboxes, and the
 `intent_features` block controlling token budgets, temperature, timeouts, and
 quarantine thresholds for the enrichment pipeline.
 
-When running inside Docker place `config.cfg` under `/etc/mailai/`. Native
+When running inside Docker place `config.yaml` under `/etc/mailai/`. Native
 deployments search the current working directory first and fall back to
-`/etc/mailai/config.cfg` and `/var/lib/mailai/config.cfg`. A reference document
-is available under [`examples/config.cfg`](../examples/config.cfg).
+`/etc/mailai/config.yaml` and `/var/lib/mailai/config.yaml`. A reference document
+is available under [`examples/config.yaml`](../examples/config.yaml).
 
 ### LLM warm-up and healthcheck timeouts
 
-The `llm` section of `config.cfg` controls how the embedded llama.cpp runtime is
+The `llm` section of `config.yaml` controls how the embedded llama.cpp runtime is
 initialised. In addition to the model location and threading parameters, three
 timeouts guard the warm-up and healthcheck sequence:
 
@@ -96,7 +96,7 @@ mailbox that contains two human-readable messages:
   metrics, privacy checks, and a `proposals` section where learner-generated
   rules are rendered as YAML diffs with an explanation.
 
-Both messages inherit their soft and hard size limits from `config.cfg`. MailAI
+Both messages inherit their soft and hard size limits from `config.yaml`. MailAI
 attempts to keep the payload below the soft ceiling by truncating verbose
 sections such as `notes` and `proposals` while preserving the most relevant
 entries. Example documents are provided under

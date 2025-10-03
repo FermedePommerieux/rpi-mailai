@@ -38,7 +38,7 @@ import pytest
 
 from mailai.config.loader import reset_runtime_config
 
-CONFIG_PATH = Path(__file__).resolve().parent / "data" / "config.cfg"
+CONFIG_PATH = Path(__file__).resolve().parent / "data" / "config.yaml"
 
 
 @pytest.fixture(autouse=True)

@@ -1,7 +1,7 @@
 """Strict configuration schemas for MailAI runtime documents.
 
 What:
-  Define the strongly typed models representing ``config.cfg``, ``rules.yaml``,
+  Define the strongly typed models representing ``config.yaml``, ``rules.yaml``,
   and ``status.yaml`` along with helper validators.
 
 Why:
@@ -339,7 +339,7 @@ class IntentFeaturesConfig(BaseModel):
 
 
 class RuntimeConfig(BaseModel):
-    """Top-level runtime configuration derived from ``config.cfg``.
+    """Top-level runtime configuration derived from ``config.yaml``.
 
     What:
       Aggregate IMAP, filesystem, LLM, and feedback settings consumed by the

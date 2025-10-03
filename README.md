@@ -98,8 +98,8 @@ identifiers and bounded scores (0..3) covering:
 - `suspicion_flags` – closed vocabulary including `link_mismatch`,
   `attachment_push`, and other high-signal heuristics.
 
-The optional enrichment pipeline is enabled through the new
-`intent_features` section in `config.cfg` (see `examples/config.yaml`). Messages
+The optional enrichment pipeline is enabled through the
+`intent_features` section in `config.yaml` (see `examples/intent_features.yaml`). Messages
 exceeding the configured `scam_singularity_quarantine` threshold are isolated in
 the quarantine mailbox without ever persisting plaintext content.
 

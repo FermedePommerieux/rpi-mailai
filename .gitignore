@@ -6,6 +6,8 @@ __pycache__/
 .venv/
 venv/
 data/
+!tests/data/
+!tests/data/config.yaml
 config/secrets/
 config/*.yml
 !.gitkeep

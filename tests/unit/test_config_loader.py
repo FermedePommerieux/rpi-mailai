@@ -3,7 +3,7 @@ Module: tests/unit/test_config_loader.py
 
 What:
     Validate the configuration loader helpers by exercising happy-path parsing,
-    multi-format ingestion, and error signalling routines exposed to callers.
+    YAML ingestion, and error signalling routines exposed to callers.
 
 Why:
     These tests ensure the runtime configuration bootstrap defends against
@@ -11,15 +11,14 @@ Why:
     with partially initialised settings or stale cached state.
 
 How:
-    Each test feeds representative YAML/JSON payloads or missing files through
-    the loader façade, asserting on structured schema objects and raised
+    Each test feeds representative YAML payloads or missing files through the
+    loader façade, asserting on structured schema objects and raised
     exceptions to guarantee invariants around timeouts, mailbox mappings, and
     runtime cache resets.
 
 Interfaces:
     test_parse_and_validate_roundtrip, test_invalid_rules_raise_config_load_error,
-    test_load_runtime_config_from_yaml, test_load_runtime_config_from_json,
-    test_missing_config_raises
+    test_load_runtime_config_from_yaml, test_missing_config_raises
 
 Invariants & Safety Rules:
     - Runtime cache must be cleared before each load to avoid cross-test bleed.
@@ -27,7 +26,6 @@ Invariants & Safety Rules:
       on-disk payload is invalid or missing.
 """
 
-import json
 import pathlib
 
 import pytest
@@ -112,7 +110,7 @@ def test_load_runtime_config_from_yaml(tmp_path, monkeypatch):
     Returns:
         None
     """
-    config_path = tmp_path / "config.cfg"
+    config_path = tmp_path / "config.yaml"
     config_path.write_text(
         """
 version: 1
@@ -163,76 +161,6 @@ feedback:
     assert runtime.llm.healthcheck_timeout_s == 15
 
 
-def test_load_runtime_config_from_json(tmp_path, monkeypatch):
-    """
-    What:
-        Validate the JSON configuration loader pathway mirrors the YAML behaviour.
-
-    Why:
-        Operators may provide JSON instead of YAML; parity ensures the
-        configuration validator remains format-agnostic while still enforcing
-        LLM timeout and mailbox invariants.
-
-    How:
-        Serialize a dictionary to JSON, write it to disk, point the loader at the
-        file, reset cache state, and confirm the resulting model echoes the
-        encoded values.
-
-    Args:
-        tmp_path: Temporary directory fixture for constructing the JSON file.
-        monkeypatch: Fixture for setting environment variables in isolation.
-
-    Returns:
-        None
-    """
-    config_path = tmp_path / "config.json"
-    payload = {
-        "version": 1,
-        "paths": {
-            "state_dir": "/var/lib/mailai",
-            "config_dir": "/etc/mailai",
-            "models_dir": "/var/lib/mailai/models",
-        },
-        "imap": {
-            "default_mailbox": "Inbox",
-            "control_namespace": "Drafts",
-            "quarantine_subfolder": "Quarantine",
-        },
-        "mail": {
-            "rules": {
-                "subject": "MailAI: rules.yaml",
-                "folder": "Drafts",
-                "limits": {"soft_limit": 10, "hard_limit": 20},
-            },
-            "status": {
-                "subject": "MailAI: status.yaml",
-                "folder": "Drafts",
-                "limits": {"soft_limit": 10, "hard_limit": 20},
-            },
-        },
-        "llm": {
-            "model_path": "/models/model.gguf",
-            "threads": 2,
-            "ctx_size": 512,
-            "sentinel_path": "/state/sentinel.json",
-            "max_age": 7200,
-            "load_timeout_s": 90,
-            "warmup_completion_timeout_s": 12,
-            "healthcheck_timeout_s": 8,
-        },
-        "feedback": {"enabled": False, "mailbox": None, "subject_prefix": None},
-    }
-    config_path.write_text(json.dumps(payload))
-    monkeypatch.setenv("MAILAI_CONFIG_PATH", str(config_path))
-    reset_runtime_config()
-    runtime = load_runtime_config()
-    assert runtime.llm.threads == 2
-    assert runtime.mail.rules.limits.hard_limit == 20
-    assert runtime.llm.load_timeout_s == 90
-    assert runtime.llm.warmup_completion_timeout_s == 12
-    assert runtime.llm.healthcheck_timeout_s == 8
-
-
 def test_missing_config_raises(tmp_path, monkeypatch):
     """
     What:
@@ -257,7 +185,7 @@ def test_missing_config_raises(tmp_path, monkeypatch):
     Raises:
         AssertionError: If ``RuntimeConfigError`` is not triggered.
     """
-    missing = tmp_path / "nope.cfg"
+    missing = tmp_path / "nope.yaml"
     monkeypatch.setenv("MAILAI_CONFIG_PATH", str(missing))
     reset_runtime_config()
     with pytest.raises(RuntimeConfigError):
