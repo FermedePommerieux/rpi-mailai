@@ -1,4 +1,30 @@
-"""Helpers for locating and repairing the `MailAI: rules.yaml` message."""
+"""Manage discovery and bootstrap of the ``MailAI: rules.yaml`` message.
+
+What:
+  Locate the canonical rules mail, parse its YAML payload, compute checksums, and
+  generate minimal templates when the message is missing.
+
+Why:
+  Configuration for MailAI is delivered via IMAP and treated as immutable. The
+  runtime must reliably locate, validate, and (if required) recreate the
+  ``rules.yaml`` anchor message to drive reload and learner workflows.
+
+How:
+  Uses :class:`MailAIImapClient` context managers to search and append mails,
+  normalises message bodies for checksum stability, and extracts metadata needed
+  by watcher modules.
+
+Interfaces:
+  :class:`RulesMailRef`, :func:`find_latest`, and :func:`append_minimal_template`.
+
+Invariants & Safety:
+  - Always operate in read-only sessions when fetching to avoid accidental flag
+    updates.
+  - Enforce UTF-8 fallbacks for body parsing so corruption does not abort the
+    reload cycle.
+  - YAML payloads are normalised to Unix newlines before hashing to remain stable
+    across providers.
+"""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -18,7 +44,30 @@ from .client import MailAIImapClient
 
 @dataclass
 class RulesMailRef:
-    """Reference to the canonical rules mail."""
+    """Lightweight descriptor for the canonical rules mail.
+
+    What:
+      Stores UID, metadata, and a normalised body string to support change
+      detection and checksum comparisons.
+
+    Why:
+      Separating metadata from the heavy email payload keeps watcher logic fast
+      and avoids repeated MIME parsing during polling.
+
+    How:
+      Capture the minimal IMAP fields needed by the watcher: UID, message-id,
+      internal date, charset, normalised body text, and a MailAI checksum. The
+      dataclass is populated by :func:`find_latest`, which performs MIME parsing
+      and newline normalisation before constructing the instance.
+
+    Attributes:
+      uid: UID of the rules message.
+      message_id: Optional ``Message-ID`` header value.
+      internaldate: Server-provided internal date for ordering.
+      charset: Charset used to decode the body.
+      body_text: Normalised body string (Unix newlines, trailing newline).
+      checksum: Digest of ``body_text`` used for change detection.
+    """
 
     uid: int
     message_id: Optional[str]
@@ -34,7 +83,30 @@ def find_latest(
     *,
     client: MailAIImapClient,
 ) -> Optional[RulesMailRef]:
-    """Return the most recent `rules.yaml` mail for the given subject."""
+    """Fetch the latest rules mail reference from IMAP.
+
+    What:
+      Searches the target ``folder`` for mails matching ``subject`` and returns a
+      :class:`RulesMailRef` describing the newest match.
+
+    Why:
+      The watcher subsystem needs metadata to detect configuration changes
+      without repeatedly parsing the full message body.
+
+    How:
+      Uses :meth:`MailAIImapClient.session` in read-only mode, issues a UID
+      search, fetches headers/body, and normalises content and timestamps before
+      computing a checksum.
+
+    Args:
+      subject: Subject override; defaults to configured ``mail.rules.subject``.
+      folder: Folder override; defaults to configured ``mail.rules.folder``.
+      client: Connected :class:`MailAIImapClient`.
+
+    Returns:
+      A :class:`RulesMailRef` for the latest message or ``None`` if no match was
+      found.
+    """
 
     settings = get_runtime_config()
     effective_subject = subject or settings.mail.rules.subject
@@ -88,7 +160,27 @@ def append_minimal_template(
     *,
     client: MailAIImapClient,
 ) -> RulesMailRef:
-    """Append a minimal configuration template and return its reference."""
+    """Create a minimal ``rules.yaml`` message if one is missing.
+
+    What:
+      Appends a YAML template email and returns its :class:`RulesMailRef`.
+
+    Why:
+      Initial deployments or disaster recovery may find the rules mail missing;
+      bootstrapping a template gives operators a starting point.
+
+    How:
+      Builds a minimal :class:`RulesV2` document, renders it to YAML, and appends
+      it to the designated folder before delegating to :func:`find_latest` to
+      return metadata.
+
+    Args:
+      folder: Optional override for the target folder.
+      client: Connected IMAP client used for the append.
+
+    Returns:
+      :class:`RulesMailRef` for the newly appended message.
+    """
 
     settings = get_runtime_config()
     target_folder = folder or settings.mail.rules.folder
@@ -106,10 +198,44 @@ def append_minimal_template(
 
 
 def _normalise_text(text: str) -> str:
+    """Standardise line endings and ensure trailing newline for hashing.
+
+    What:
+      Converts CRLF to LF, strips trailing whitespace, and appends a single
+      newline.
+
+    Why:
+      Keeps checksum calculations stable across providers that adjust line
+      endings.
+
+    Args:
+      text: Raw body text extracted from the message.
+
+    Returns:
+      Normalised text ready for hashing and storage.
+    """
+
     return text.replace("\r\n", "\n").rstrip() + "\n"
 
 
 def _parse_internaldate(value: object) -> Optional[datetime]:
+    """Parse ``INTERNALDATE`` responses into :class:`datetime` values.
+
+    What:
+      Attempts to convert common ``imapclient`` return types into timezone-aware
+      datetimes.
+
+    Why:
+      Some servers return bytes while others return strings; this helper keeps
+      handling consistent without leaking parsing errors to callers.
+
+    Args:
+      value: Raw value from ``IMAPClient.fetch``.
+
+    Returns:
+      Parsed :class:`datetime` or ``None`` if parsing fails.
+    """
+
     if value is None:
         return None
     if isinstance(value, bytes):
@@ -126,6 +252,24 @@ def _parse_internaldate(value: object) -> Optional[datetime]:
 
 
 def _first(data: dict, *keys: bytes) -> Optional[bytes]:
+    """Return the first present ``data`` value for ``keys`` as bytes.
+
+    What:
+      Iterates through potential fetch keys and returns the first value coerced
+      to bytes.
+
+    Why:
+      Different IMAP servers emit slightly different keys (e.g., ``BODY[HEADER]``
+      vs ``BODY.PEEK[HEADER]``). This helper smooths those differences.
+
+    Args:
+      data: Fetch dictionary returned by ``IMAPClient``.
+      *keys: Candidate keys ordered by priority.
+
+    Returns:
+      Matching value as bytes, or ``None`` if absent.
+    """
+
     for key in keys:
         if key in data:
             value = data[key]
@@ -134,3 +278,6 @@ def _first(data: dict, *keys: bytes) -> Optional[bytes]:
             if isinstance(value, str):
                 return value.encode("utf-8")
     return None
+
+
+# TODO: Other modules in this repository still require the same What/Why/How documentation.
