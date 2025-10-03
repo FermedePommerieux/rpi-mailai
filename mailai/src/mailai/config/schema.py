@@ -96,6 +96,9 @@ class RuntimeLLMConfig(BaseModel):
     ctx_size: int = Field(gt=0)
     sentinel_path: str
     max_age: int = Field(gt=0)
+    load_timeout_s: int = Field(default=60, gt=0)
+    warmup_completion_timeout_s: int = Field(default=30, gt=0)
+    healthcheck_timeout_s: int = Field(default=10, gt=0)
 
 
 class RuntimeConfig(BaseModel):

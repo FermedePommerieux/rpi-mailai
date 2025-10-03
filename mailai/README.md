@@ -49,7 +49,16 @@ loader accepts either YAML or JSON and validates the payload against the
 [`RuntimeConfig`](mailai/src/mailai/config/schema.py) schema. Typical settings
 include IMAP defaults (control namespace, quarantine folder, configuration
 subjects), size limits for the control mails, filesystem paths for state and
-models, local LLM parameters, and optional feedback mailboxes.
+models, local LLM parameters, and optional feedback mailboxes. The `llm`
+section supports timeouts that control start-up and health probes:
+
+- `load_timeout_s` – wall-clock allowance for loading the GGUF weights before
+  the runtime reports a failure (defaults to 60 seconds).
+- `warmup_completion_timeout_s` – time budget for issuing the synthetic
+  completion used during warm-up to ensure the bindings work (defaults to 30
+  seconds).
+- `healthcheck_timeout_s` – per-request timeout for periodic liveness checks
+  after the runtime is serving traffic (defaults to 10 seconds).
 
 When running inside Docker place `config.cfg` under `/etc/mailai/`. Native
 deployments search the current working directory first and fall back to
