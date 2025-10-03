@@ -76,7 +76,8 @@ model via `LLM_MODEL_PATH` and override other variables as needed:
   secrets, and fails fast when directories are missing or misconfigured.
 - A warmup routine loads the GGUF model via `llama-cpp-python`, performs a tiny
   completion (`"ok?"` with four tokens), and aborts the container if it cannot
-  complete within five seconds.
+  complete within the configurable timeout (default ten seconds via
+  `warmup_completion_timeout_s`).
 - The healthcheck reuses the in-process integration and fails whenever the model
   cannot be loaded or respond, ensuring orchestrators detect LLM regressions.
 - The root filesystem is kept read-only at runtime; only `/var/lib/mailai`
