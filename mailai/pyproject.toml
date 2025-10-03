@@ -28,6 +28,7 @@ test = [
 
 [project.scripts]
 mailai = "mailai.cli:main"
+mailai-accountctl = "mailai.accountctl:main"
 
 [tool.setuptools]
 package-dir = {"" = "src"}

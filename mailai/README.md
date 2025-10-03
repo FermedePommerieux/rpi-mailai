@@ -43,6 +43,40 @@ and never persists cleartext email data.
   interval.
 - `mailai learn-now`: trigger the learning pipeline immediately.
 - `mailai diag --redact`: emit a redacted diagnostics report.
+- `mailai-accountctl`: manage IMAP account metadata stored in ``accounts.yaml``.
+
+### Managing IMAP accounts
+
+Use the ``mailai-accountctl`` helper to create, inspect, and remove accounts in
+``accounts.yaml``. The command is intentionally non-interactive so it can run in
+automation pipelines:
+
+```bash
+# Create or update an account definition
+mailai-accountctl --accounts /etc/mailai/accounts.yaml set personal \
+  --host imap.example.net \
+  --port 993 \
+  --username doe@example.net \
+  --password-file /run/secrets/personal_imap_password \
+  --control-namespace Drafts \
+  --quarantine-subfolder Quarantine \
+  --hash-salt /run/secrets/global_hash_salt \
+  --pepper /run/secrets/personal_pepper \
+  --sqlcipher-key /run/secrets/sqlcipher_key
+
+# List configured accounts
+mailai-accountctl --accounts /etc/mailai/accounts.yaml list
+
+# Show a single account (secret paths are redacted to basenames)
+mailai-accountctl --accounts /etc/mailai/accounts.yaml show personal
+
+# Remove an account definition
+mailai-accountctl --accounts /etc/mailai/accounts.yaml remove personal
+```
+
+The command emits JSON payloads for ``set``, ``show``, and ``remove`` to keep
+shell scripting and configuration management straightforward. Example output is
+provided in [`examples/accounts.yaml`](../examples/accounts.yaml).
 
 ## Global runtime configuration
 
