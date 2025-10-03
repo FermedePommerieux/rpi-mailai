@@ -1,106 +1,136 @@
-"""Helpers for managing the `MailAI: rules.yaml` message."""
+"""Helpers for locating and repairing the `MailAI: rules.yaml` message."""
 from __future__ import annotations
 
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from email import policy
 from email.message import EmailMessage
+from email.parser import BytesParser
+from email.utils import make_msgid, parsedate_to_datetime
 from typing import Optional
 
-from typing import Optional
-
-from ..config.loader import LoadedDocument, dump_rules, load_rules, YamlValidationError
+from ..config.loader import get_runtime_config
 from ..config.schema import RulesV2
+from ..config import yamlshim
 from ..utils.ids import checksum
 from .client import MailAIImapClient
 
-RULES_SUBJECT = "MailAI: rules.yaml"
-RULES_BACKUP_SUBJECT = "MailAI: rules.bak.yaml"
-HARD_LIMIT = 128 * 1024
+
+@dataclass
+class RulesMailRef:
+    """Reference to the canonical rules mail."""
+
+    uid: int
+    message_id: Optional[str]
+    internaldate: datetime
+    charset: str
+    body_text: str
+    checksum: str
 
 
-def read_rules(client: MailAIImapClient, *, fallback: Optional[bytes] = None) -> LoadedDocument:
-    """Fetch and validate the latest rules YAML from the mailbox."""
+def find_latest(
+    subject: Optional[str] = None,
+    folder: Optional[str] = None,
+    *,
+    client: MailAIImapClient,
+) -> Optional[RulesMailRef]:
+    """Return the most recent `rules.yaml` mail for the given subject."""
 
-    uid = client.get_rules_email(RULES_SUBJECT)
-    if uid is None:
-        return _restore_rules(client, fallback)
-    with client.control_session(readonly=True):
-        payload = client.client.fetch([uid], [b"RFC822"])[uid][b"RFC822"]
-    try:
-        document = load_rules(payload)
-    except YamlValidationError:
-        return _repair_rules(client, fallback)
-    _ensure_backup(client, payload)
-    return document
+    settings = get_runtime_config()
+    effective_subject = subject or settings.mail.rules.subject
+    target_folder = folder or settings.mail.rules.folder
+    with client.session(target_folder, readonly=True):
+        uids = client.client.search(["SUBJECT", effective_subject])
+        if not uids:
+            return None
+        uid = max(uids)
+        data = client.client.fetch(
+            [uid],
+            [
+                b"BODY.PEEK[HEADER]",
+                b"BODY.PEEK[TEXT]",
+                b"RFC822.SIZE",
+                b"INTERNALDATE",
+            ],
+        )[uid]
+    header_bytes = _first(data, b"BODY.PEEK[HEADER]", b"BODY[HEADER]")
+    body_bytes = _first(data, b"BODY.PEEK[TEXT]", b"BODY[TEXT]")
+    if header_bytes is None and body_bytes is None:
+        return None
+    if header_bytes is None:
+        header_bytes = b""
+    if body_bytes is None:
+        body_bytes = b""
+    combined = header_bytes + b"\r\n" + body_bytes
+    message = BytesParser(policy=policy.default).parsebytes(combined)
+    body = message.get_body(preferencelist=("plain",))
+    charset = body.get_content_charset("utf-8") if body else message.get_content_charset("utf-8")
+    text = body.get_content() if body else message.get_content()
+    if not isinstance(text, str):
+        text = text.decode(charset or "utf-8")  # type: ignore[union-attr]
+    normalised = _normalise_text(text)
+    digest = checksum(normalised.encode("utf-8"))
+    message_id = message.get("Message-ID")
+    internal_raw = _first(data, b"INTERNALDATE")
+    internaldate = _parse_internaldate(internal_raw) or datetime.now(timezone.utc)
+    return RulesMailRef(
+        uid=uid,
+        message_id=message_id,
+        internaldate=internaldate,
+        charset=charset or "utf-8",
+        body_text=normalised,
+        checksum=digest,
+    )
 
 
-def upsert_rules(client: MailAIImapClient, model: RulesV2) -> str:
-    """Upload a rules document, replacing previous copies."""
+def append_minimal_template(
+    folder: Optional[str] = None,
+    *,
+    client: MailAIImapClient,
+) -> RulesMailRef:
+    """Append a minimal configuration template and return its reference."""
 
-    payload = dump_rules(model)
-    if len(payload) > HARD_LIMIT:
-        raise ValueError("rules.yaml exceeds 128KB hard limit")
-    with client.control_session():
-        _delete_existing(client, RULES_SUBJECT)
-        message = _build_message(RULES_SUBJECT, payload)
-        client.client.append(client.control_mailbox, message.as_bytes())
-        _delete_existing(client, RULES_BACKUP_SUBJECT)
-        backup = _build_message(RULES_BACKUP_SUBJECT, payload)
-        client.client.append(client.control_mailbox, backup.as_bytes())
-    return checksum(payload)
-
-
-def _delete_existing(client: MailAIImapClient, subject: str) -> None:
-    uids = client.client.search(["SUBJECT", subject])
-    if not uids:
-        return
-    client.client.delete_messages(uids)
-    client.client.expunge()
-
-
-def _build_message(subject: str, payload: bytes) -> EmailMessage:
+    settings = get_runtime_config()
+    target_folder = folder or settings.mail.rules.folder
+    minimal = RulesV2.minimal()
+    yaml_text = yamlshim.dump(minimal.model_dump(mode="json"))
     message = EmailMessage()
-    message["Subject"] = subject
+    message["Subject"] = settings.mail.rules.subject
     message["From"] = "mailai@local"
     message["To"] = "mailai@local"
-    message.set_content(payload.decode("utf-8"))
-    return message
+    message["Message-ID"] = make_msgid(domain="mailai.local")
+    message.set_content(yaml_text, subtype="yaml")
+    with client.session(target_folder, readonly=False) as mailbox:
+        client.client.append(mailbox, message.as_bytes())
+    return find_latest(subject=settings.mail.rules.subject, folder=target_folder, client=client)
 
 
-def _restore_rules(client: MailAIImapClient, fallback: Optional[bytes]) -> LoadedDocument:
-    if fallback is not None:
-        document = load_rules(fallback)
-        upsert_rules(client, document.model)
-        return document
-    minimal = RulesV2.minimal()
-    payload = dump_rules(minimal)
-    upsert_rules(client, minimal)
-    return load_rules(payload)
+def _normalise_text(text: str) -> str:
+    return text.replace("\r\n", "\n").rstrip() + "\n"
 
 
-def _repair_rules(client: MailAIImapClient, fallback: Optional[bytes]) -> LoadedDocument:
-    with client.control_session(readonly=True):
-        backup_uid = client.client.search(["SUBJECT", RULES_BACKUP_SUBJECT])
-        if backup_uid:
-            data = client.client.fetch(backup_uid, [b"RFC822"])[backup_uid[-1]][b"RFC822"]
-            try:
-                document = load_rules(data)
-            except YamlValidationError:
-                document = None
-            else:
-                upsert_rules(client, document.model)
-                return document
-    return _restore_rules(client, fallback)
+def _parse_internaldate(value: object) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, bytes):
+        try:
+            return parsedate_to_datetime(value.decode("utf-8"))
+        except (ValueError, TypeError):
+            return None
+    if isinstance(value, str):
+        try:
+            return parsedate_to_datetime(value)
+        except (ValueError, TypeError):
+            return None
+    return None
 
 
-def _ensure_backup(client: MailAIImapClient, payload: bytes) -> None:
-    digest = checksum(payload)
-    backup_uid = client.get_rules_email(RULES_BACKUP_SUBJECT)
-    if backup_uid is not None:
-        with client.control_session(readonly=True):
-            stored = client.client.fetch([backup_uid], [b"RFC822"])[backup_uid][b"RFC822"]
-        if checksum(stored) == digest:
-            return
-    with client.control_session():
-        _delete_existing(client, RULES_BACKUP_SUBJECT)
-        message = _build_message(RULES_BACKUP_SUBJECT, payload)
-        client.client.append(client.control_mailbox, message.as_bytes())
-
+def _first(data: dict, *keys: bytes) -> Optional[bytes]:
+    for key in keys:
+        if key in data:
+            value = data[key]
+            if isinstance(value, bytes):
+                return value
+            if isinstance(value, str):
+                return value.encode("utf-8")
+    return None

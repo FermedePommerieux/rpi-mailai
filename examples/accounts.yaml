@@ -7,7 +7,7 @@ accounts:
       ssl: true
       username: "doe@example.net"
       password_file: "/run/secrets/personal_imap_password"
-      control_namespace: "MailIA"
+      control_namespace: "Drafts"
       quarantine_subfolder: "Quarantine"
     secrets:
       hash_salt: "/run/secrets/global_hash_salt"
@@ -20,7 +20,7 @@ accounts:
       ssl: true
       username: "doe@example.com"
       password_file: "/run/secrets/work_imap_password"
-      control_namespace: "MailIA"
+      control_namespace: "Drafts"
       quarantine_subfolder: "Quarantine"
     secrets:
       hash_salt: "/run/secrets/global_hash_salt"

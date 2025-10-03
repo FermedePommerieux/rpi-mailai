@@ -27,7 +27,7 @@ Threat modelling quick-reference:
 ## Operational flows
 
 - `mailai once`: run a single inference pass against the selected account. The
-  agent mounts the `MailIA/` control mailbox, restores missing configuration if
+  agent mounts the `Drafts` control mailbox, restores missing configuration if
   required, and emits a fresh `status.yaml` snapshot in dry-run mode by default.
 - `mailai watch`: identical to `once` but loops according to the configured
   `schedule.inference_interval_s`. Auto-repair logic for `rules.yaml` is invoked

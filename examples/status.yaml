@@ -1,6 +1,6 @@
 run_id: "2025-02-12T08:15:00Z"
 config_checksum: "sha256:example"
-mailbox: "MailIA"
+mailbox: "Drafts"
 last_run_started_at: "2025-02-12T08:15:00Z"
 last_run_finished_at: "2025-02-12T08:15:05Z"
 mode:
