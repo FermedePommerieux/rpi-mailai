@@ -364,17 +364,23 @@ def parse_and_validate(yaml_text: str) -> RulesV2:
 
     What:
       Decode YAML text, ensure it produces a mapping, and validate it using the
-      strict schema.
+      strict schema while supporting the streamlined "rules-only" storage
+      format.
 
     Why:
       The rules document originates from user-maintained email bodies; the engine
       must guard against malformed or malicious payloads before applying actions
-      to messages.
+      to messages. New deployments only persist the ``rules`` list to avoid
+      confusing operators with internal defaults, so the loader needs to hydrate
+      the remaining fields deterministically.
 
     How:
       Delegate to the YAML shim for parsing, assert the result is a dictionary,
-      and feed it into :meth:`RulesV2.model_validate`, wrapping validation errors
-      in :class:`ConfigLoadError` for uniform handling.
+      and branch based on the keys present. When only ``rules`` (and optionally
+      ``version``) are provided, merge them into the baseline
+      :meth:`RulesV2.minimal` template before validation. For legacy payloads that
+      still include the full schema, fall back to the strict validation path to
+      remain backwards compatible.
 
     Args:
       yaml_text: Raw ``rules.yaml`` contents in UTF-8 text form.
@@ -392,6 +398,21 @@ def parse_and_validate(yaml_text: str) -> RulesV2:
         raise ConfigLoadError(f"Invalid YAML: {exc}") from exc
     if not isinstance(payload, dict):
         raise ConfigLoadError("rules.yaml must contain a mapping at the top-level")
+    # The streamlined format only exposes the ``rules`` list to operators.
+    allowed_keys = {"rules", "version"}
+    payload_keys = set(payload)
+    if payload_keys.issubset(allowed_keys):
+        if "rules" not in payload:
+            raise ConfigLoadError("rules.yaml must define a 'rules' list")
+        version = payload.get("version")
+        if version is not None and version != 2:
+            raise ConfigLoadError("rules.yaml version must be 2")
+        baseline = RulesV2.minimal().model_dump(mode="json")
+        baseline["rules"] = payload["rules"]
+        try:
+            return RulesV2.model_validate(baseline)
+        except ValidationError as exc:
+            raise ConfigLoadError(str(exc)) from exc
     try:
         return RulesV2.model_validate(payload)
     except ValidationError as exc:
@@ -496,24 +517,27 @@ def dump_rules(model: RulesV2) -> bytes:
 
     What:
       Convert the validated rules model into a YAML payload suitable for
-      persistence.
+      persistence while emitting only the public ``rules`` list.
 
     Why:
-      Ensures backups and IMAP uploads use a consistent representation that is
-      stable across runs for diffing.
+      Operators should not see or edit internal defaults inside the IMAP control
+      message. Persisting just the rule definitions keeps the document concise
+      and prevents accidental edits that could desynchronise runtime settings.
 
     How:
-      Dump the model using ``mode="json"`` to obtain a serialisable dictionary
-      and feed it to the YAML shim before encoding to UTF-8 bytes.
+      Dump the model using ``mode="json"``, extract the ``rules`` collection, and
+      feed the reduced mapping to the YAML shim before encoding to UTF-8 bytes.
 
     Args:
       model: Validated rules configuration.
 
     Returns:
-      Canonical YAML bytes representing the rules.
+      Canonical YAML bytes representing only the rule list.
     """
 
-    return yamlshim.dump(model.model_dump(mode="json")).encode("utf-8")
+    payload = model.model_dump(mode="json")
+    rules_only = {"rules": payload.get("rules", [])}
+    return yamlshim.dump(rules_only).encode("utf-8")
 
 
 def dump_status(model: StatusV2) -> bytes:

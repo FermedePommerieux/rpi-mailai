@@ -35,9 +35,8 @@ from email.parser import BytesParser
 from email.utils import make_msgid, parsedate_to_datetime
 from typing import Optional
 
-from ..config.loader import get_runtime_config
+from ..config.loader import dump_rules, get_runtime_config
 from ..config.schema import RulesV2
-from ..config import yamlshim
 from ..utils.ids import checksum
 from .client import MailAIImapClient
 
@@ -163,16 +162,19 @@ def append_minimal_template(
     """Create a minimal ``rules.yaml`` message if one is missing.
 
     What:
-      Appends a YAML template email and returns its :class:`RulesMailRef`.
+      Appends a YAML template email containing only the public ``rules`` list and
+      returns its :class:`RulesMailRef`.
 
     Why:
       Initial deployments or disaster recovery may find the rules mail missing;
-      bootstrapping a template gives operators a starting point.
+      bootstrapping a template gives operators a starting point without exposing
+      internal defaults that could be mis-edited.
 
     How:
-      Builds a minimal :class:`RulesV2` document, renders it to YAML, and appends
-      it to the designated folder before delegating to :func:`find_latest` to
-      return metadata.
+      Builds a minimal :class:`RulesV2` document, serialises just its ``rules``
+      via :func:`mailai.config.loader.dump_rules`, and appends it to the
+      designated folder before delegating to :func:`find_latest` to return
+      metadata.
 
     Args:
       folder: Optional override for the target folder.
@@ -185,7 +187,7 @@ def append_minimal_template(
     settings = get_runtime_config()
     target_folder = folder or settings.mail.rules.folder
     minimal = RulesV2.minimal()
-    yaml_text = yamlshim.dump(minimal.model_dump(mode="json"))
+    yaml_text = dump_rules(minimal).decode("utf-8")
     message = EmailMessage()
     message["Subject"] = settings.mail.rules.subject
     message["From"] = "mailai@local"
