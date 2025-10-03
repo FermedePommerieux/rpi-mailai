@@ -1,134 +1,138 @@
 #!/bin/sh
-set -eu
-# shellcheck disable=SC3040
-if set -o pipefail 2>/dev/null; then
-    :
-fi
+set -euo pipefail
 
 log() {
-    printf '%s\n' "$*" >&2
+    printf '[mailai-entrypoint] %s\n' "$*" >&2
 }
 
 fail() {
-    log "[fatal] $*"
+    log "fatal: $*"
     exit 1
 }
 
-check_directory() {
-    dir_path=$1
+require_dir() {
+    dir=$1
     mode=$2
-    if [ ! -d "$dir_path" ]; then
-        fail "required directory $dir_path is missing"
+    if [ ! -d "$dir" ]; then
+        fail "required directory $dir is missing"
     fi
-    if [ ! -r "$dir_path" ]; then
-        fail "required directory $dir_path must be readable"
+    if [ ! -r "$dir" ]; then
+        fail "required directory $dir must be readable"
     fi
-    if [ "$mode" = "rw" ] && [ ! -w "$dir_path" ]; then
-        fail "required directory $dir_path must be writable"
-    fi
-    if [ "$mode" = "ro" ] && [ -w "$dir_path" ]; then
-        fail "directory $dir_path must be mounted read-only"
+    case "$mode" in
+        rw)
+            if [ ! -w "$dir" ]; then
+                fail "required directory $dir must be writable"
+            fi
+            ;;
+        ro)
+            if [ -w "$dir" ]; then
+                fail "directory $dir must be mounted read-only"
+            fi
+            ;;
+        *)
+            fail "unknown mode $mode for $dir"
+            ;;
+    esac
+}
+
+check_secret_file() {
+    file=$1
+    if [ -f "$file" ]; then
+        perm=$(stat -c '%a' "$file")
+        if [ "$perm" != "600" ]; then
+            fail "secret $file must have permissions 0600 (found $perm)"
+        fi
     fi
 }
 
-check_secret_permissions() {
-    base_dir=$1
-    if [ ! -d "$base_dir" ]; then
+check_secrets() {
+    base=/etc/mailai
+    if [ ! -d "$base" ]; then
         return 0
     fi
-    find "$base_dir" -maxdepth 1 -type f \
-        \( -iname '*secret*' -o -iname '*password*' -o -iname '*token*' -o -iname '*key*' -o -iname '*pepper*' \) \
-        -exec sh -c '
-            for file do
-                perm=$(stat -c "%a" "$file")
-                if [ "$perm" != "600" ]; then
-                    printf "[fatal] secret %s must have permissions 0600 (found %s)\n" "$file" "$perm" >&2
-                    exit 1
-                fi
-            done
-        ' sh {} +
+    check_secret_file "${MAILAI_ACCOUNTS:-$base/accounts.yaml}"
+    find "$base" -maxdepth 1 -type f \
+        \( -name '*.key' -o -name '*.pem' -o -name 'pepper' -o -name 'pepper.txt' \) \
+        -print0 | while IFS= read -r -d '' secret; do
+            check_secret_file "$secret"
+        done
 }
 
-query_llm() {
-    python - "$LLM_BASE_URL" "$LLM_HEALTH_MODEL" <<'PY'
-import json
-import sys
-import urllib.error
-import urllib.request
+warmup_llm() {
+    log "warming up local LLM"
+    if ! timeout 5 python - <<'PY'; then
+        fail "LLM warmup failed"
+    fi
+PY
+import os
+from pathlib import Path
 
-base = (sys.argv[1] or "http://llama-server:8080/v1").rstrip("/")
-model_hint = sys.argv[2]
+from llama_cpp import Llama
 
-def resolve_model():
-    if model_hint:
-        return model_hint
-    try:
-        with urllib.request.urlopen(base + "/models", timeout=5) as response:
-            payload = json.load(response)
-    except Exception as exc:  # pylint: disable=broad-except
-        raise SystemExit(f"unable to query LLM models: {exc}")
-    data = payload.get("data")
-    if not data:
-        raise SystemExit("no models returned by LLM")
-    first = data[0]
-    model_id = first.get("id")
-    if not model_id:
-        raise SystemExit("LLM response missing model id")
-    return model_id
+model_path = os.environ.get("LLM_MODEL_PATH")
+if not model_path:
+    raise SystemExit("LLM_MODEL_PATH is not set")
+model_file = Path(model_path)
+if not model_file.is_file():
+    raise SystemExit(f"model file not found: {model_file}")
 
-model_id = resolve_model()
-body = json.dumps({
-    "model": model_id,
-    "messages": [{"role": "user", "content": "ok?"}],
-    "max_tokens": 4,
-}).encode()
-request = urllib.request.Request(
-    base + "/chat/completions",
-    data=body,
-    headers={"Content-Type": "application/json"},
+threads = int(os.environ.get("LLM_N_THREADS", "3") or 3)
+ctx_size = int(os.environ.get("LLM_CTX_SIZE", "2048") or 2048)
+
+llm = Llama(
+    model_path=str(model_file),
+    n_ctx=ctx_size,
+    n_threads=threads,
+    logits_all=False,
+    embedding=False,
+    verbose=False,
 )
 try:
-    with urllib.request.urlopen(request, timeout=5) as response:
-        if response.status != 200:
-            raise SystemExit(f"unexpected status {response.status}")
-        json.load(response)
-except urllib.error.URLError as exc:
-    raise SystemExit(f"LLM request failed: {exc}")
+    result = llm(
+        "ok?",
+        max_tokens=4,
+        temperature=0.0,
+        top_p=1.0,
+        repeat_penalty=1.0,
+        return_dict=True,
+    )
+finally:
+    del llm
+
+choices = result.get("choices") if isinstance(result, dict) else None
+if not choices:
+    raise SystemExit("warmup returned no choices")
 PY
+    log "LLM warmup succeeded"
 }
 
-check_llm() {
-    retries=3
-    attempt=1
-    while [ "$attempt" -le "$retries" ]; do
-        if query_llm >/dev/null 2>&1; then
-            return 0
-        fi
-        log "waiting for LLM to become ready (attempt $attempt/$retries)"
-        attempt=$((attempt + 1))
-        sleep 2
-    done
-    query_llm
-}
+MAILAI_VALIDATE=${MAILAI_VALIDATE:-0}
+LLM_MODEL_PATH=${LLM_MODEL_PATH:-}
+LLM_N_THREADS=${LLM_N_THREADS:-3}
+LLM_CTX_SIZE=${LLM_CTX_SIZE:-2048}
+export LLM_MODEL_PATH LLM_N_THREADS LLM_CTX_SIZE MAILAI_VALIDATE
 
-LLM_BASE_URL=${LLM_BASE_URL:-http://llama-server:8080/v1}
-LLM_HEALTH_MODEL=${LLM_HEALTH_MODEL:-}
-export LLM_BASE_URL
-export LLM_HEALTH_MODEL
+require_dir /etc/mailai ro
+require_dir /var/lib/mailai rw
+require_dir /models ro
 
-check_directory /etc/mailai ro
-check_directory /var/lib/mailai rw
-check_directory /models ro
+check_secrets
 
-check_secret_permissions /etc/mailai
-
-if ! check_llm; then
-    fail "LLM service is not reachable"
+if [ -z "$LLM_MODEL_PATH" ]; then
+    fail "LLM_MODEL_PATH is required"
+fi
+if [ ! -f "$LLM_MODEL_PATH" ]; then
+    fail "LLM model file $LLM_MODEL_PATH not found"
 fi
 
-if [ "${MAILAI_VALIDATE:-0}" = "1" ]; then
+warmup_llm
+
+if [ "$MAILAI_VALIDATE" = "1" ]; then
     log "running mailai diagnostics"
-    mailai diag --redact
+    if ! mailai diag --redact; then
+        fail "mailai diagnostics failed"
+    fi
 fi
 
 exec "$@"
