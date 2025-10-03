@@ -7,9 +7,8 @@ import os
 import sys
 import time
 from pathlib import Path
-from typing import Final
 
-_DEFAULT_SENTINEL: Final[str] = "/var/lib/mailai/.cache/llm_ready.json"
+from .config.loader import RuntimeConfigError, get_runtime_config
 
 
 def _int_from_env(name: str, default: int) -> int:
@@ -50,9 +49,16 @@ def _touch_model(model_file: Path) -> None:
 
 
 def main() -> int:
-    model_path = os.environ.get("LLM_MODEL_PATH")
+    try:
+        runtime = get_runtime_config()
+    except RuntimeConfigError as exc:
+        print(str(exc), file=sys.stderr)
+        return 1
+
+    llm_cfg = runtime.llm
+    model_path = os.environ.get("LLM_MODEL_PATH", llm_cfg.model_path)
     if not model_path:
-        print("LLM_MODEL_PATH is not set", file=sys.stderr)
+        print("LLM model path is not configured", file=sys.stderr)
         return 1
 
     model_file = Path(model_path)
@@ -60,8 +66,8 @@ def main() -> int:
         print(f"model file not found: {model_file}", file=sys.stderr)
         return 1
 
-    sentinel_path = Path(os.environ.get("LLM_HEALTH_SENTINEL", _DEFAULT_SENTINEL))
-    max_age = _int_from_env("LLM_HEALTH_MAX_AGE", 86400)
+    sentinel_path = Path(os.environ.get("LLM_HEALTH_SENTINEL", llm_cfg.sentinel_path))
+    max_age = _int_from_env("LLM_HEALTH_MAX_AGE", llm_cfg.max_age)
 
     try:
         payload = _load_json(sentinel_path)
@@ -77,8 +83,8 @@ def main() -> int:
         )
         return 1
 
-    threads = _int_from_env("LLM_N_THREADS", 3)
-    ctx_size = _int_from_env("LLM_CTX_SIZE", 2048)
+    threads = _int_from_env("LLM_N_THREADS", llm_cfg.threads)
+    ctx_size = _int_from_env("LLM_CTX_SIZE", llm_cfg.ctx_size)
 
     sentinel_threads = payload.get("threads")
     sentinel_ctx = payload.get("ctx_size")

@@ -7,6 +7,8 @@ from collections import deque
 from dataclasses import dataclass
 from typing import Deque, Iterable, Iterator, List, Optional, Set
 
+from ..config.loader import get_runtime_config
+
 try:  # pragma: no cover - optional dependency
     from imapclient import IMAPClient
 except ImportError:  # pragma: no cover - fallback for test environment
@@ -22,9 +24,18 @@ class ImapConfig:
     password: str
     port: int = 993
     ssl: bool = True
-    folder: str = "INBOX"
-    control_namespace: str = "MailIA"
-    quarantine_subfolder: str = "Quarantine"
+    folder: Optional[str] = None
+    control_namespace: Optional[str] = None
+    quarantine_subfolder: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        settings = get_runtime_config()
+        if self.folder is None:
+            self.folder = settings.imap.default_mailbox
+        if self.control_namespace is None:
+            self.control_namespace = settings.imap.control_namespace
+        if self.quarantine_subfolder is None:
+            self.quarantine_subfolder = settings.imap.quarantine_subfolder
 
 
 class MailAIImapClient:
@@ -47,6 +58,8 @@ class MailAIImapClient:
         self._client.login(self._config.username, self._config.password)
         self._refresh_mailboxes()
         self._bootstrap_control_mailboxes()
+        if self._config.folder is None:
+            raise RuntimeError("Default mailbox not configured")
         self._select(self._config.folder)
         return self
 
@@ -118,11 +131,16 @@ class MailAIImapClient:
         return normalized
 
     def _bootstrap_control_mailboxes(self) -> None:
+        if self._config.control_namespace is None or self._config.quarantine_subfolder is None:
+            raise RuntimeError("Control namespace not configured")
         control = self._normalize_path(self._config.control_namespace)
-        quarantine = self._normalize_path(self._config.control_namespace, self._config.quarantine_subfolder)
+        quarantine = self._normalize_path(
+            self._config.control_namespace, self._config.quarantine_subfolder
+        )
         self._control_mailbox = self._ensure_mailbox(control)
         self._quarantine_mailbox = self._ensure_mailbox(quarantine)
-        self._ensure_mailbox(self._config.folder)
+        if self._config.folder is not None:
+            self._ensure_mailbox(self._config.folder)
 
     def _throttle(self) -> None:
         now = time.monotonic()
@@ -138,6 +156,18 @@ class MailAIImapClient:
         self._select(self.control_mailbox, readonly=readonly)
         try:
             yield self.control_mailbox
+        finally:
+            if previous:
+                self._select(previous, readonly=False)
+
+    @contextlib.contextmanager
+    def session(self, mailbox: str, *, readonly: bool = False) -> Iterator[str]:
+        """Temporarily select an arbitrary mailbox."""
+
+        previous = self._selected
+        self._select(mailbox, readonly=readonly)
+        try:
+            yield self._selected or mailbox
         finally:
             if previous:
                 self._select(previous, readonly=False)

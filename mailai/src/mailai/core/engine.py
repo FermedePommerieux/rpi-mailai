@@ -4,7 +4,13 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Set
 
+from ..config.backup import EncryptedRulesBackup
+from ..config.loader import ConfigLoadError, get_runtime_config, parse_and_validate
 from ..config.schema import Rule, RulesV2
+from ..config.status_store import StatusStore
+from ..config.watcher import change_reason, has_changed
+from ..imap.client import MailAIImapClient
+from ..imap.rules_mail import append_minimal_template, find_latest
 from ..imap.actions import ActionRequest, SupportsActions, execute
 from ..utils.logging import JsonLogger
 from ..utils.regexsafe import search
@@ -199,3 +205,124 @@ def _normalize_payload(payload: object) -> Dict[str, object]:
     if isinstance(payload, dict):
         return payload
     raise TypeError("Unsupported payload type")
+
+
+def load_active_rules(
+    *,
+    client: MailAIImapClient,
+    status: StatusStore,
+    backup: EncryptedRulesBackup,
+    logger: JsonLogger,
+    run_id: str,
+) -> RulesV2:
+    """Load the ruleset ensuring configuration safety guarantees."""
+
+    previous = status.current_config_ref()
+    latest = find_latest(client=client)
+    runtime = get_runtime_config()
+    if latest is None:
+        restored = append_minimal_template(client=client)
+        status.update_config_ref(restored)
+        status.mark_restored(from_backup=False)
+        status.append_event("config_restored", "missing")
+        logger.warning(
+            "config_restored",
+            run_id=run_id,
+            reason="missing",
+            old_uid=previous.uid if previous else None,
+            new_uid=restored.uid,
+            old_checksum=previous.checksum if previous else None,
+            new_checksum=restored.checksum,
+        )
+        backup.save(restored.body_text)
+        return parse_and_validate(restored.body_text)
+
+    size = len(latest.body_text.encode("utf-8"))
+    hard_limit = runtime.mail.rules.limits.hard_limit
+    if size > hard_limit:
+        status.mark_invalid()
+        status.append_event("config_invalid", f"oversize: {size}")
+        logger.error(
+            "config_invalid",
+            run_id=run_id,
+            reason="oversize",
+            size=size,
+            old_uid=previous.uid if previous else None,
+            new_uid=latest.uid,
+            old_checksum=previous.checksum if previous else None,
+            new_checksum=latest.checksum,
+        )
+        restored = append_minimal_template(client=client)
+        status.update_config_ref(restored, reset_errors=False)
+        used_backup = backup.has_backup()
+        status.mark_restored(from_backup=used_backup)
+        status.append_event("config_restored", "oversize")
+        logger.warning(
+            "config_restored",
+            run_id=run_id,
+            reason="oversize",
+            old_uid=previous.uid if previous else None,
+            new_uid=restored.uid,
+            old_checksum=previous.checksum if previous else None,
+            new_checksum=restored.checksum,
+        )
+        if used_backup:
+            fallback = backup.last_known_good()
+        else:
+            fallback = restored.body_text
+            backup.save(restored.body_text)
+        return parse_and_validate(fallback)
+
+    if not has_changed(previous, latest):
+        cached = backup.last_known_good()
+        return parse_and_validate(cached)
+
+    try:
+        rules = parse_and_validate(latest.body_text)
+    except ConfigLoadError as exc:
+        status.mark_invalid()
+        status.append_event("config_invalid", f"parse error: {exc}")
+        logger.error(
+            "config_invalid",
+            run_id=run_id,
+            reason="parse error",
+            error=str(exc),
+            old_uid=previous.uid if previous else None,
+            new_uid=latest.uid,
+            old_checksum=previous.checksum if previous else None,
+            new_checksum=latest.checksum,
+        )
+        restored = append_minimal_template(client=client)
+        status.update_config_ref(restored, reset_errors=False)
+        used_backup = backup.has_backup()
+        status.mark_restored(from_backup=used_backup)
+        status.append_event("config_restored", "parse error")
+        logger.warning(
+            "config_restored",
+            run_id=run_id,
+            reason="parse error",
+            old_uid=previous.uid if previous else None,
+            new_uid=restored.uid,
+            old_checksum=previous.checksum if previous else None,
+            new_checksum=restored.checksum,
+        )
+        fallback = backup.last_known_good() if used_backup else restored.body_text
+        if not used_backup:
+            backup.save(restored.body_text)
+        return parse_and_validate(fallback)
+
+    backup.save(latest.body_text)
+    status.update_config_ref(latest)
+    status.mark_restored(from_backup=False)
+    reason = change_reason(previous, latest)
+    status.append_event("config_updated", reason)
+    logger.info(
+        "config_updated",
+        run_id=run_id,
+        reason=reason,
+        old_uid=previous.uid if previous else None,
+        new_uid=latest.uid,
+        old_checksum=previous.checksum if previous else None,
+        new_checksum=latest.checksum,
+    )
+    return rules

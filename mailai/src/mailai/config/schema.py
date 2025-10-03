@@ -1,69 +1,133 @@
-"""Lightweight schema validation for MailAI configuration documents."""
+"""Pydantic models describing MailAI configuration documents."""
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional
+from datetime import datetime
+from typing import Any, Dict, List, Literal, Optional
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError as _PydanticValidationError
+from pydantic import field_validator, model_validator
 
 
 class ValidationError(ValueError):
     """Raised when configuration data does not satisfy the schema."""
 
 
-def _ensure_keys(name: str, data: Dict[str, Any], allowed: List[str]) -> None:
-    extra = set(data) - set(allowed)
-    if extra:
-        raise ValidationError(f"{name}: unexpected keys {sorted(extra)}")
+class SizeLimits(BaseModel):
+    """Size thresholds enforced when syncing IMAP resources."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    soft_limit: int = Field(ge=0)
+    hard_limit: int = Field(gt=0)
+
+    @model_validator(mode="after")
+    def _validate_limits(cls, model: "SizeLimits") -> "SizeLimits":
+        if model.hard_limit < model.soft_limit:
+            raise ValidationError("hard_limit must be greater than or equal to soft_limit")
+        return model
 
 
-def _require(data: Dict[str, Any], key: str) -> Any:
-    if key not in data:
-        raise ValidationError(f"Missing required key '{key}'")
-    return data[key]
+class RulesMailConfig(BaseModel):
+    """Configuration describing how the rules mail is stored."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    subject: str
+    folder: str
+    limits: SizeLimits
 
 
-def _ensure_type(name: str, value: Any, expected_type: type) -> Any:
-    if not isinstance(value, expected_type):
-        raise ValidationError(f"{name} expected {expected_type.__name__}")
-    return value
+class StatusMailConfig(BaseModel):
+    """Configuration describing how the status mail is stored."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    subject: str
+    folder: Optional[str] = None
+    limits: SizeLimits
 
 
-def _ensure_bool(name: str, value: Any) -> bool:
-    if not isinstance(value, bool):
-        raise ValidationError(f"{name} expected bool")
-    return value
+class MailSettings(BaseModel):
+    """Top-level mail resource configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    rules: RulesMailConfig
+    status: StatusMailConfig
 
 
-def _ensure_list(name: str, value: Any) -> List[Any]:
-    if not isinstance(value, list):
-        raise ValidationError(f"{name} expected list")
-    return value
+class ImapSettings(BaseModel):
+    """Server level IMAP defaults used by the runtime."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    default_mailbox: str = "INBOX"
+    control_namespace: str
+    quarantine_subfolder: str
 
 
-def _ensure_dict(name: str, value: Any) -> Dict[str, Any]:
+class PathsConfig(BaseModel):
+    """Filesystem layout used by the runtime."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    state_dir: str
+    config_dir: str
+    models_dir: str
+
+
+class FeedbackConfig(BaseModel):
+    """User feedback controls."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    mailbox: Optional[str] = None
+    subject_prefix: Optional[str] = None
+
+
+class RuntimeLLMConfig(BaseModel):
+    """Runtime parameters for the embedded LLM."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_path: str
+    threads: int = Field(gt=0)
+    ctx_size: int = Field(gt=0)
+    sentinel_path: str
+    max_age: int = Field(gt=0)
+
+
+class RuntimeConfig(BaseModel):
+    """Root configuration loaded from ``config.cfg``."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    version: int = 1
+    paths: PathsConfig
+    imap: ImapSettings
+    mail: MailSettings
+    llm: RuntimeLLMConfig
+    feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
+
+
+def _ensure_dict(value: Any, name: str) -> Dict[str, Any]:
     if not isinstance(value, dict):
         raise ValidationError(f"{name} expected mapping")
     return value
 
 
-def _ensure_enum(name: str, value: Any, *, allowed: List[str]) -> str:
-    if not isinstance(value, str):
-        raise ValidationError(f"{name} expected string from {allowed}")
-    if value not in allowed:
-        raise ValidationError(f"{name} must be one of {allowed}")
+def _ensure_list(value: Any, name: str) -> List[Any]:
+    if not isinstance(value, list):
+        raise ValidationError(f"{name} expected list")
     return value
 
 
-def _ensure_number(name: str, value: Any) -> float:
-    if not isinstance(value, (int, float)):
-        raise ValidationError(f"{name} expected number")
-    return float(value)
-
-
-def _condition_from_dict(data: Dict[str, Any]) -> Dict[str, Any]:
-    if len(data) != 1:
+def _normalise_condition(value: Dict[str, Any]) -> Dict[str, Any]:
+    if len(value) != 1:
         raise ValidationError("condition must have exactly one entry")
-    field, payload = next(iter(data.items()))
-    if field not in {
+    field, payload = next(iter(value.items()))
+    allowed = {
         "header",
         "category_pred",
         "subject",
@@ -76,198 +140,109 @@ def _condition_from_dict(data: Dict[str, Any]) -> Dict[str, Any]:
         "has_attachment",
         "attachment_name",
         "range",
-    }:
+    }
+    if field not in allowed:
         raise ValidationError(f"unsupported condition field '{field}'")
     if isinstance(payload, dict):
         return {field: dict(payload)}
     return {field: payload}
 
 
-def _parse_actions(actions: List[Any]) -> List[Dict[str, Any]]:
-    parsed: List[Dict[str, Any]] = []
-    for item in actions:
-        mapping = _ensure_dict("action", item)
-        if len(mapping) != 1:
-            raise ValidationError("action must contain exactly one operation")
-        parsed.append(dict(mapping))
-    return parsed
+class Metadata(BaseModel):
+    """Metadata describing the rules document."""
 
+    model_config = ConfigDict(extra="forbid")
 
-def _parse_conditions(name: str, values: Optional[List[Any]]) -> List[Dict[str, Any]]:
-    if values is None:
-        return []
-    parsed: List[Dict[str, Any]] = []
-    for item in values:
-        condition = _ensure_dict("condition", item)
-        parsed.append(_condition_from_dict(condition))
-    return parsed
-
-
-@dataclass
-class Metadata:
     description: str
     owner: str
     updated_at: str
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Metadata":
-        _ensure_keys("meta", data, ["description", "owner", "updated_at"])
-        return cls(
-            description=_ensure_type("meta.description", _require(data, "description"), str),
-            owner=_ensure_type("meta.owner", _require(data, "owner"), str),
-            updated_at=_ensure_type("meta.updated_at", _require(data, "updated_at"), str),
-        )
 
+class Schedule(BaseModel):
+    """Learning and inference schedule configuration."""
 
-@dataclass
-class Schedule:
+    model_config = ConfigDict(extra="forbid")
+
     learn_cron: str
     inference_interval_s: int
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Schedule":
-        _ensure_keys("schedule", data, ["learn_cron", "inference_interval_s"])
-        return cls(
-            learn_cron=_ensure_type("schedule.learn_cron", _require(data, "learn_cron"), str),
-            inference_interval_s=int(
-                _ensure_type("schedule.inference_interval_s", _require(data, "inference_interval_s"), int)
-            ),
-        )
 
+class EncryptionConfig(BaseModel):
+    """Privacy encryption configuration."""
 
-@dataclass
-class EncryptionConfig:
-    enabled: bool
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
     key_path: str
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "EncryptionConfig":
-        _ensure_keys("encryption", data, ["enabled", "key_path"])
-        return cls(
-            enabled=_ensure_bool("encryption.enabled", data.get("enabled", True)),
-            key_path=_ensure_type("encryption.key_path", _require(data, "key_path"), str),
-        )
 
+class PrivacyConfig(BaseModel):
+    """Settings governing privacy guarantees."""
 
-@dataclass
-class PrivacyConfig:
+    model_config = ConfigDict(extra="forbid")
+
     feature_store_path: str
     encryption: EncryptionConfig
     hashing_pepper_path: str
     hashing_salt_path: str
     max_plaintext_window_chars: int
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "PrivacyConfig":
-        _ensure_keys(
-            "privacy",
-            data,
-            [
-                "feature_store_path",
-                "encryption",
-                "hashing_pepper_path",
-                "hashing_salt_path",
-                "max_plaintext_window_chars",
-            ],
-        )
-        return cls(
-            feature_store_path=_ensure_type(
-                "privacy.feature_store_path", _require(data, "feature_store_path"), str
-            ),
-            encryption=EncryptionConfig.from_dict(_ensure_dict("privacy.encryption", _require(data, "encryption"))),
-            hashing_pepper_path=_ensure_type(
-                "privacy.hashing_pepper_path", _require(data, "hashing_pepper_path"), str
-            ),
-            hashing_salt_path=_ensure_type(
-                "privacy.hashing_salt_path", _require(data, "hashing_salt_path"), str
-            ),
-            max_plaintext_window_chars=int(
-                _ensure_type(
-                    "privacy.max_plaintext_window_chars",
-                    _require(data, "max_plaintext_window_chars"),
-                    int,
-                )
-            ),
-        )
 
+class LLMConfig(BaseModel):
+    """Local LLM serving configuration."""
 
-@dataclass
-class LLMConfig:
+    model_config = ConfigDict(extra="forbid")
+
     provider: str
     model: str
     max_tokens: int
     temperature: float
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "LLMConfig":
-        _ensure_keys("llm", data, ["provider", "model", "max_tokens", "temperature"])
-        return cls(
-            provider=_ensure_type("llm.provider", _require(data, "provider"), str),
-            model=_ensure_type("llm.model", _require(data, "model"), str),
-            max_tokens=int(_ensure_number("llm.max_tokens", _require(data, "max_tokens"))),
-            temperature=float(_ensure_number("llm.temperature", _require(data, "temperature"))),
-        )
+
+class EmbeddingConfig(BaseModel):
+    """Embedding backend configuration."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    backend: Optional[str] = None
+    dim: Optional[int] = None
+
+    @model_validator(mode="after")
+    def _validate_backend(cls, model: "EmbeddingConfig") -> "EmbeddingConfig":
+        if model.enabled:
+            if not model.backend:
+                raise ValidationError("embeddings.backend required when enabled")
+            if model.dim is None:
+                raise ValidationError("embeddings.dim required when enabled")
+        return model
 
 
-@dataclass
-class EmbeddingConfig:
-    enabled: bool
-    backend: Optional[str]
-    dim: Optional[int]
+class RuleSynthesisConfig(BaseModel):
+    """Learner configuration for synthetic rule proposals."""
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "EmbeddingConfig":
-        _ensure_keys("embeddings", data, ["enabled", "backend", "dim"])
-        enabled = _ensure_bool("embeddings.enabled", data.get("enabled", False))
-        backend = data.get("backend") if enabled else None
-        if enabled and not isinstance(backend, str):
-            raise ValidationError("embeddings.backend required when enabled")
-        dim = data.get("dim") if enabled else None
-        if enabled and not isinstance(dim, int):
-            raise ValidationError("embeddings.dim required when enabled")
-        return cls(enabled=enabled, backend=backend, dim=dim)
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    max_rules_per_pass: int = 3
+    require_user_confirmation: bool = True
 
 
-@dataclass
-class RuleSynthesisConfig:
-    enabled: bool
-    max_rules_per_pass: int
-    require_user_confirmation: bool
+class DeleteSemanticsConfig(BaseModel):
+    """Settings for delete semantics inference."""
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "RuleSynthesisConfig":
-        _ensure_keys("rule_synthesis", data, ["enabled", "max_rules_per_pass", "require_user_confirmation"])
-        return cls(
-            enabled=_ensure_bool("rule_synthesis.enabled", data.get("enabled", True)),
-            max_rules_per_pass=int(
-                _ensure_number("rule_synthesis.max_rules_per_pass", data.get("max_rules_per_pass", 3))
-            ),
-            require_user_confirmation=_ensure_bool(
-                "rule_synthesis.require_user_confirmation", data.get("require_user_confirmation", True)
-            ),
-        )
+    model_config = ConfigDict(extra="forbid")
+
+    infer_meaning: bool = True
+    signals: List[str] = Field(default_factory=list)
 
 
-@dataclass
-class DeleteSemanticsConfig:
-    infer_meaning: bool
-    signals: List[str]
+class LearningConfig(BaseModel):
+    """High level learning pipeline settings."""
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "DeleteSemanticsConfig":
-        _ensure_keys("delete_semantics", data, ["infer_meaning", "signals"])
-        signals = _ensure_list("delete_semantics.signals", data.get("signals", []))
-        for item in signals:
-            _ensure_type("delete_semantics.signal", item, str)
-        return cls(
-            infer_meaning=_ensure_bool("delete_semantics.infer_meaning", data.get("infer_meaning", True)),
-            signals=signals,
-        )
+    model_config = ConfigDict(extra="forbid")
 
-
-@dataclass
-class LearningConfig:
-    enabled: bool
+    enabled: bool = True
     window_days: int
     min_samples_per_class: int
     llm: LLMConfig
@@ -275,161 +250,69 @@ class LearningConfig:
     rule_synthesis: RuleSynthesisConfig
     delete_semantics: DeleteSemanticsConfig
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "LearningConfig":
-        _ensure_keys(
-            "learning",
-            data,
-            [
-                "enabled",
-                "window_days",
-                "min_samples_per_class",
-                "llm",
-                "embeddings",
-                "rule_synthesis",
-                "delete_semantics",
-            ],
-        )
-        return cls(
-            enabled=_ensure_bool("learning.enabled", data.get("enabled", True)),
-            window_days=int(_ensure_number("learning.window_days", _require(data, "window_days"))),
-            min_samples_per_class=int(
-                _ensure_number("learning.min_samples_per_class", _require(data, "min_samples_per_class"))
-            ),
-            llm=LLMConfig.from_dict(_ensure_dict("learning.llm", _require(data, "llm"))),
-            embeddings=EmbeddingConfig.from_dict(_ensure_dict("learning.embeddings", _require(data, "embeddings"))),
-            rule_synthesis=RuleSynthesisConfig.from_dict(
-                _ensure_dict("learning.rule_synthesis", _require(data, "rule_synthesis"))
-            ),
-            delete_semantics=DeleteSemanticsConfig.from_dict(
-                _ensure_dict("learning.delete_semantics", _require(data, "delete_semantics"))
-            ),
-        )
+
+class DefaultsConfig(BaseModel):
+    """Global defaults affecting rule execution."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    case_sensitive: bool = False
+    stop_on_first_match: bool = False
+    dry_run: bool = True
 
 
-@dataclass
-class DefaultsConfig:
-    case_sensitive: bool
-    stop_on_first_match: bool
-    dry_run: bool
+class RuleMatch(BaseModel):
+    """Container for rule match clauses."""
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "DefaultsConfig":
-        _ensure_keys("defaults", data, ["case_sensitive", "stop_on_first_match", "dry_run"])
-        return cls(
-            case_sensitive=_ensure_bool("defaults.case_sensitive", data.get("case_sensitive", False)),
-            stop_on_first_match=_ensure_bool("defaults.stop_on_first_match", data.get("stop_on_first_match", False)),
-            dry_run=_ensure_bool("defaults.dry_run", data.get("dry_run", True)),
-        )
+    model_config = ConfigDict(extra="forbid")
 
+    any: List[Dict[str, Any]] = Field(default_factory=list)
+    all: List[Dict[str, Any]] = Field(default_factory=list)
+    none: List[Dict[str, Any]] = Field(default_factory=list)
 
-@dataclass
-class RuleMatch:
-    any: List[Dict[str, Any]] = field(default_factory=list)
-    all: List[Dict[str, Any]] = field(default_factory=list)
-    none: List[Dict[str, Any]] = field(default_factory=list)
-
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "RuleMatch":
-        _ensure_keys("match", data, ["any", "all", "none"])
-        if not any(data.get(key) for key in ("any", "all", "none")):
+    @model_validator(mode="after")
+    def _normalise(cls, model: "RuleMatch") -> "RuleMatch":
+        if not model.any and not model.all and not model.none:
             raise ValidationError("match must define at least one clause")
-        return cls(
-            any=_parse_conditions("match.any", data.get("any")),
-            all=_parse_conditions("match.all", data.get("all")),
-            none=_parse_conditions("match.none", data.get("none")),
-        )
+        model.any = [_normalise_condition(_ensure_dict(item, "match.any")) for item in model.any]
+        model.all = [_normalise_condition(_ensure_dict(item, "match.all")) for item in model.all]
+        model.none = [_normalise_condition(_ensure_dict(item, "match.none")) for item in model.none]
+        return model
 
 
-@dataclass
-class Rule:
+class Rule(BaseModel):
+    """Representation of a single automation rule."""
+
+    model_config = ConfigDict(extra="forbid")
+
     id: str
     description: str
     why: str
-    source: str
-    enabled: bool
+    source: Literal["deterministic", "learner"]
+    enabled: bool = True
     priority: int
     match: RuleMatch
     actions: List[Dict[str, Any]]
 
+    @field_validator("actions", mode="before")
     @classmethod
-    def from_dict(cls, data: Dict[str, Any]) -> "Rule":
-        _ensure_keys(
-            "rule",
-            data,
-            ["id", "description", "why", "source", "enabled", "priority", "match", "actions"],
-        )
-        return cls(
-            id=_ensure_type("rule.id", _require(data, "id"), str),
-            description=_ensure_type("rule.description", _require(data, "description"), str),
-            why=_ensure_type("rule.why", _require(data, "why"), str),
-            source=_ensure_enum("rule.source", _require(data, "source"), allowed=["deterministic", "learner"]),
-            enabled=_ensure_bool("rule.enabled", data.get("enabled", True)),
-            priority=int(_ensure_number("rule.priority", _require(data, "priority"))),
-            match=RuleMatch.from_dict(_ensure_dict("rule.match", _require(data, "match"))),
-            actions=_parse_actions(_ensure_list("rule.actions", _require(data, "actions"))),
-        )
+    def _validate_actions(cls, value: Any) -> List[Dict[str, Any]]:
+        items = _ensure_list(value, "rule.actions")
+        result: List[Dict[str, Any]] = []
+        for item in items:
+            mapping = _ensure_dict(item, "rule.action")
+            if len(mapping) != 1:
+                raise ValidationError("action must contain exactly one operation")
+            result.append(dict(mapping))
+        return result
 
 
-def _default_metadata() -> Metadata:
-    return Metadata(
-        description="Default MailAI policy",
-        owner="mailai",
-        updated_at="1970-01-01T00:00:00Z",
-    )
+class RulesV2(BaseModel):
+    """Top-level configuration for rule execution."""
 
+    model_config = ConfigDict(extra="forbid")
 
-def _default_schedule() -> Schedule:
-    return Schedule(learn_cron="0 3 * * *", inference_interval_s=900)
-
-
-def _default_privacy() -> PrivacyConfig:
-    return PrivacyConfig(
-        feature_store_path="/var/lib/mailai/features.db",
-        encryption=EncryptionConfig(enabled=True, key_path="/run/secrets/sqlcipher_key"),
-        hashing_pepper_path="/run/secrets/account_pepper",
-        hashing_salt_path="/run/secrets/global_hash_salt",
-        max_plaintext_window_chars=2048,
-    )
-
-
-def _default_learning() -> LearningConfig:
-    return LearningConfig(
-        enabled=True,
-        window_days=14,
-        min_samples_per_class=5,
-        llm=LLMConfig(provider="local", model="mailai-tiny", max_tokens=512, temperature=0.0),
-        embeddings=EmbeddingConfig(enabled=False, backend=None, dim=None),
-        rule_synthesis=RuleSynthesisConfig(enabled=True, max_rules_per_pass=3, require_user_confirmation=True),
-        delete_semantics=DeleteSemanticsConfig(
-            infer_meaning=True,
-            signals=["calendar_invite_past", "thread_is_resolved"],
-        ),
-    )
-
-
-def _default_defaults() -> DefaultsConfig:
-    return DefaultsConfig(case_sensitive=False, stop_on_first_match=False, dry_run=True)
-
-
-def _default_rules() -> List[Rule]:
-    baseline_match = RuleMatch(any=[{"mailbox": {"equals": "INBOX"}}], all=[], none=[])
-    baseline_rule = Rule(
-        id="baseline",
-        description="Baseline catch-all to leave messages untouched",
-        why="Ensures the engine records activity even when no automation is configured",
-        source="deterministic",
-        enabled=True,
-        priority=100,
-        match=baseline_match,
-        actions=[{"stop_processing": True}],
-    )
-    return [baseline_rule]
-
-
-@dataclass
-class RulesV2:
-    version: int
+    version: Literal[2]
     meta: Metadata
     schedule: Schedule
     privacy: PrivacyConfig
@@ -438,86 +321,65 @@ class RulesV2:
     rules: List[Rule]
 
     @classmethod
-    def model_validate(cls, data: Dict[str, Any]) -> "RulesV2":
-        _ensure_keys(
-            "rules.yaml",
-            data,
-            ["version", "meta", "schedule", "privacy", "learning", "defaults", "rules"],
-        )
-        version = int(_ensure_number("version", _require(data, "version")))
-        if version != 2:
-            raise ValidationError("version must be 2")
-        rules_data = _ensure_list("rules", data.get("rules", []))
-        rules = [Rule.from_dict(_ensure_dict("rule", item)) for item in rules_data]
-        return cls(
-            version=version,
-            meta=Metadata.from_dict(_ensure_dict("meta", _require(data, "meta"))),
-            schedule=Schedule.from_dict(_ensure_dict("schedule", _require(data, "schedule"))),
-            privacy=PrivacyConfig.from_dict(_ensure_dict("privacy", _require(data, "privacy"))),
-            learning=LearningConfig.from_dict(_ensure_dict("learning", _require(data, "learning"))),
-            defaults=DefaultsConfig.from_dict(_ensure_dict("defaults", _require(data, "defaults"))),
-            rules=rules,
-        )
+    def model_validate(cls, data: Dict[str, Any]) -> "RulesV2":  # type: ignore[override]
+        try:
+            return super().model_validate(data)
+        except _PydanticValidationError as exc:  # pragma: no cover - exercised indirectly
+            raise ValidationError(str(exc)) from exc
 
-    def model_dump(self, mode: str = "json") -> Dict[str, Any]:
-        return {
-            "version": self.version,
-            "meta": self.meta.__dict__,
-            "schedule": self.schedule.__dict__,
-            "privacy": {
-                "feature_store_path": self.privacy.feature_store_path,
-                "encryption": self.privacy.encryption.__dict__,
-                "hashing_pepper_path": self.privacy.hashing_pepper_path,
-                "hashing_salt_path": self.privacy.hashing_salt_path,
-                "max_plaintext_window_chars": self.privacy.max_plaintext_window_chars,
-            },
-            "learning": {
-                "enabled": self.learning.enabled,
-                "window_days": self.learning.window_days,
-                "min_samples_per_class": self.learning.min_samples_per_class,
-                "llm": self.learning.llm.__dict__,
-                "embeddings": self.learning.embeddings.__dict__,
-                "rule_synthesis": self.learning.rule_synthesis.__dict__,
-                "delete_semantics": {
-                    "infer_meaning": self.learning.delete_semantics.infer_meaning,
-                    "signals": list(self.learning.delete_semantics.signals),
-                },
-            },
-            "defaults": self.defaults.__dict__,
-            "rules": [
-                {
-                    "id": rule.id,
-                    "description": rule.description,
-                    "source": rule.source,
-                    "enabled": rule.enabled,
-                    "priority": rule.priority,
-                    "match": {
-                        key: getattr(rule.match, key)
-                        for key in ["any", "all", "none"]
-                        if getattr(rule.match, key)
-                    },
-                    "actions": rule.actions,
-                    "why": rule.why,
-                }
-                for rule in self.rules
-            ],
-        }
+    def model_dump(self, mode: str = "json") -> Dict[str, Any]:  # type: ignore[override]
+        return super().model_dump()
 
     @classmethod
     def minimal(cls) -> "RulesV2":
+        baseline_match = RuleMatch(any=[{"mailbox": {"equals": "INBOX"}}], all=[], none=[])
+        baseline_rule = Rule(
+            id="baseline",
+            description="Baseline catch-all to leave messages untouched",
+            why="Ensures the engine records activity even when no automation is configured",
+            source="deterministic",
+            enabled=True,
+            priority=100,
+            match=baseline_match,
+            actions=[{"stop_processing": True}],
+        )
         return cls(
             version=2,
-            meta=_default_metadata(),
-            schedule=_default_schedule(),
-            privacy=_default_privacy(),
-            learning=_default_learning(),
-            defaults=_default_defaults(),
-            rules=_default_rules(),
+            meta=Metadata(
+                description="Default MailAI policy",
+                owner="mailai",
+                updated_at="1970-01-01T00:00:00Z",
+            ),
+            schedule=Schedule(learn_cron="0 3 * * *", inference_interval_s=900),
+            privacy=PrivacyConfig(
+                feature_store_path="/var/lib/mailai/features.db",
+                encryption=EncryptionConfig(enabled=True, key_path="/run/secrets/sqlcipher_key"),
+                hashing_pepper_path="/run/secrets/account_pepper",
+                hashing_salt_path="/run/secrets/global_hash_salt",
+                max_plaintext_window_chars=2048,
+            ),
+            learning=LearningConfig(
+                enabled=True,
+                window_days=14,
+                min_samples_per_class=5,
+                llm=LLMConfig(provider="local", model="mailai-tiny", max_tokens=512, temperature=0.0),
+                embeddings=EmbeddingConfig(enabled=False, backend=None, dim=None),
+                rule_synthesis=RuleSynthesisConfig(enabled=True, max_rules_per_pass=3, require_user_confirmation=True),
+                delete_semantics=DeleteSemanticsConfig(
+                    infer_meaning=True,
+                    signals=["calendar_invite_past", "thread_is_resolved"],
+                ),
+            ),
+            defaults=DefaultsConfig(case_sensitive=False, stop_on_first_match=False, dry_run=True),
+            rules=[baseline_rule],
         )
 
 
-@dataclass
-class StatusSummary:
+class StatusSummary(BaseModel):
+    """Summary metrics for the latest run."""
+
+    model_config = ConfigDict(extra="forbid")
+
     scanned_messages: int
     matched_messages: int
     actions_applied: int
@@ -525,193 +387,104 @@ class StatusSummary:
     warnings: int
 
 
-@dataclass
-class RuleMetrics:
+class RuleMetrics(BaseModel):
+    """Per-rule execution metrics."""
+
+    model_config = ConfigDict(extra="forbid")
+
     matches: int
     actions: int
     errors: int
 
 
-@dataclass
-class Proposal:
+class LearningMetrics(BaseModel):
+    """Metrics emitted by the learning pipeline."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    last_train_started_at: Optional[str] = None
+    last_train_finished_at: Optional[str] = None
+    samples_used: int = 0
+    classes: List[str] = Field(default_factory=list)
+    macro_f1: Optional[float] = None
+    proposed_rules: int = 0
+    delete_semantics: Dict[str, int] = Field(default_factory=dict)
+
+
+class PrivacyStatus(BaseModel):
+    """Operational state of privacy safeguards."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    feature_store_encrypted: bool = True
+    plaintext_leaks_detected: int = 0
+    pepper_rotation_due: bool = False
+
+
+class Proposal(BaseModel):
+    """Learner generated rule proposal."""
+
+    model_config = ConfigDict(extra="forbid")
+
     rule_id: str
     diff: str
     why: str
 
 
-@dataclass
-class LearningMetrics:
-    last_train_started_at: Optional[str]
-    last_train_finished_at: Optional[str]
-    samples_used: int
-    classes: List[str]
-    macro_f1: Optional[float]
-    proposed_rules: int
-    delete_semantics: Dict[str, int]
+class ConfigReference(BaseModel):
+    """Reference pointing to the active configuration message."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    uid: int
+    message_id: Optional[str]
+    internaldate: str
+    checksum: str
 
 
-@dataclass
-class PrivacyStatus:
-    feature_store_encrypted: bool
-    plaintext_leaks_detected: int
-    pepper_rotation_due: bool
+class StatusEvent(BaseModel):
+    """Timeline event describing configuration activity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    ts: str
+    type: Literal["config_updated", "config_invalid", "config_restored"]
+    details: str
 
 
-@dataclass
-class StatusV2:
+class StatusV2(BaseModel):
+    """Status snapshot emitted by MailAI."""
+
+    model_config = ConfigDict(extra="forbid")
+
     run_id: str
     config_checksum: str
     mailbox: str
     last_run_started_at: str
-    last_run_finished_at: Optional[str]
-    mode: Dict[str, bool]
+    last_run_finished_at: Optional[str] = None
+    mode: Dict[str, bool] = Field(default_factory=dict)
     summary: StatusSummary
-    by_rule: Dict[str, RuleMetrics]
+    by_rule: Dict[str, RuleMetrics] = Field(default_factory=dict)
     learning: LearningMetrics
     privacy: PrivacyStatus
-    notes: List[str]
-    proposals: List[Proposal]
+    notes: List[str] = Field(default_factory=list)
+    proposals: List[Proposal] = Field(default_factory=list)
+    config_ref: Optional[ConfigReference] = None
+    events: List[StatusEvent] = Field(default_factory=list)
+    restored_rules_from_backup: bool = False
 
     @classmethod
-    def model_validate(cls, data: Dict[str, Any]) -> "StatusV2":
-        _ensure_keys(
-            "status.yaml",
-            data,
-            [
-                "run_id",
-                "config_checksum",
-                "mailbox",
-                "last_run_started_at",
-                "last_run_finished_at",
-                "mode",
-                "summary",
-                "by_rule",
-                "learning",
-                "privacy",
-                "notes",
-                "proposals",
-            ],
-        )
-        summary_dict = _ensure_dict("summary", _require(data, "summary"))
-        summary = StatusSummary(
-            scanned_messages=int(_ensure_number("summary.scanned_messages", _require(summary_dict, "scanned_messages"))),
-            matched_messages=int(_ensure_number("summary.matched_messages", _require(summary_dict, "matched_messages"))),
-            actions_applied=int(_ensure_number("summary.actions_applied", _require(summary_dict, "actions_applied"))),
-            errors=int(_ensure_number("summary.errors", _require(summary_dict, "errors"))),
-            warnings=int(_ensure_number("summary.warnings", _require(summary_dict, "warnings"))),
-        )
-        by_rule_dict = _ensure_dict("by_rule", data.get("by_rule", {}))
-        rule_metrics = {
-            key: RuleMetrics(
-                matches=int(_ensure_number(f"by_rule.{key}.matches", _require(value, "matches"))),
-                actions=int(_ensure_number(f"by_rule.{key}.actions", _require(value, "actions"))),
-                errors=int(_ensure_number(f"by_rule.{key}.errors", _require(value, "errors"))),
-            )
-            for key, value in by_rule_dict.items()
-        }
-        learning_dict = _ensure_dict("learning", _require(data, "learning"))
-        learning = LearningMetrics(
-            last_train_started_at=learning_dict.get("last_train_started_at"),
-            last_train_finished_at=learning_dict.get("last_train_finished_at"),
-            samples_used=int(_ensure_number("learning.samples_used", learning_dict.get("samples_used", 0))),
-            classes=[_ensure_type("learning.classes", item, str) for item in learning_dict.get("classes", [])],
-            macro_f1=learning_dict.get("macro_f1"),
-            proposed_rules=int(_ensure_number("learning.proposed_rules", learning_dict.get("proposed_rules", 0))),
-            delete_semantics={
-                key: int(_ensure_number(f"learning.delete_semantics.{key}", value))
-                for key, value in learning_dict.get("delete_semantics", {}).items()
-            },
-        )
-        privacy_dict = _ensure_dict("privacy", _require(data, "privacy"))
-        privacy = PrivacyStatus(
-            feature_store_encrypted=_ensure_bool(
-                "privacy.feature_store_encrypted", privacy_dict.get("feature_store_encrypted", True)
-            ),
-            plaintext_leaks_detected=int(
-                _ensure_number("privacy.plaintext_leaks_detected", privacy_dict.get("plaintext_leaks_detected", 0))
-            ),
-            pepper_rotation_due=_ensure_bool("privacy.pepper_rotation_due", privacy_dict.get("pepper_rotation_due", False)),
-        )
-        proposals: List[Proposal] = []
-        for item in data.get("proposals", []):
-            mapping = _ensure_dict("proposals", item)
-            _ensure_keys("proposal", mapping, ["rule_id", "diff", "why"])
-            proposals.append(
-                Proposal(
-                    rule_id=_ensure_type("proposal.rule_id", _require(mapping, "rule_id"), str),
-                    diff=_ensure_type("proposal.diff", _require(mapping, "diff"), str),
-                    why=_ensure_type("proposal.why", _require(mapping, "why"), str),
-                )
-            )
-        return cls(
-            run_id=_ensure_type("run_id", _require(data, "run_id"), str),
-            config_checksum=_ensure_type("config_checksum", _require(data, "config_checksum"), str),
-            mailbox=_ensure_type("mailbox", _require(data, "mailbox"), str),
-            last_run_started_at=_ensure_type("last_run_started_at", _require(data, "last_run_started_at"), str),
-            last_run_finished_at=data.get("last_run_finished_at"),
-            mode={str(k): bool(v) for k, v in _ensure_dict("mode", data.get("mode", {})).items()},
-            summary=summary,
-            by_rule=rule_metrics,
-            learning=learning,
-            privacy=privacy,
-            notes=[_ensure_type("notes", item, str) for item in data.get("notes", [])],
-            proposals=proposals,
-        )
+    def model_validate(cls, data: Dict[str, Any]) -> "StatusV2":  # type: ignore[override]
+        try:
+            return super().model_validate(data)
+        except _PydanticValidationError as exc:  # pragma: no cover - exercised indirectly
+            raise ValidationError(str(exc)) from exc
 
-    def model_dump(self, mode: str = "json") -> Dict[str, Any]:
-        return {
-            "run_id": self.run_id,
-            "config_checksum": self.config_checksum,
-            "mailbox": self.mailbox,
-            "last_run_started_at": self.last_run_started_at,
-            "last_run_finished_at": self.last_run_finished_at,
-            "mode": dict(self.mode),
-            "summary": self.summary.__dict__,
-            "by_rule": {key: value.__dict__ for key, value in self.by_rule.items()},
-            "learning": {
-                "last_train_started_at": self.learning.last_train_started_at,
-                "last_train_finished_at": self.learning.last_train_finished_at,
-                "samples_used": self.learning.samples_used,
-                "classes": list(self.learning.classes),
-                "macro_f1": self.learning.macro_f1,
-                "proposed_rules": self.learning.proposed_rules,
-                "delete_semantics": dict(self.learning.delete_semantics),
-            },
-            "privacy": {
-                "feature_store_encrypted": self.privacy.feature_store_encrypted,
-                "plaintext_leaks_detected": self.privacy.plaintext_leaks_detected,
-                "pepper_rotation_due": self.privacy.pepper_rotation_due,
-            },
-            "notes": list(self.notes),
-            "proposals": [
-                {"rule_id": item.rule_id, "diff": item.diff, "why": item.why}
-                for item in self.proposals
-            ],
-        }
+    def model_dump(self, mode: str = "json") -> Dict[str, Any]:  # type: ignore[override]
+        return super().model_dump()
 
     @classmethod
     def minimal(cls) -> "StatusV2":
-        summary = StatusSummary(
-            scanned_messages=0,
-            matched_messages=0,
-            actions_applied=0,
-            errors=0,
-            warnings=0,
-        )
-        learning = LearningMetrics(
-            last_train_started_at=None,
-            last_train_finished_at=None,
-            samples_used=0,
-            classes=[],
-            macro_f1=None,
-            proposed_rules=0,
-            delete_semantics={},
-        )
-        privacy = PrivacyStatus(
-            feature_store_encrypted=True,
-            plaintext_leaks_detected=0,
-            pepper_rotation_due=False,
-        )
         return cls(
             run_id="bootstrap",
             config_checksum="",
@@ -719,10 +492,19 @@ class StatusV2:
             last_run_started_at="",
             last_run_finished_at=None,
             mode={},
-            summary=summary,
+            summary=StatusSummary(
+                scanned_messages=0,
+                matched_messages=0,
+                actions_applied=0,
+                errors=0,
+                warnings=0,
+            ),
             by_rule={},
-            learning=learning,
-            privacy=privacy,
+            learning=LearningMetrics(),
+            privacy=PrivacyStatus(),
             notes=[],
             proposals=[],
+            config_ref=None,
+            events=[],
+            restored_rules_from_backup=False,
         )

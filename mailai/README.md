@@ -42,10 +42,24 @@ and never persists cleartext email data.
 - `mailai learn-now`: trigger the learning pipeline immediately.
 - `mailai diag --redact`: emit a redacted diagnostics report.
 
+## Global runtime configuration
+
+MailAI centralises all runtime tunables inside a single `config.cfg` file. The
+loader accepts either YAML or JSON and validates the payload against the
+[`RuntimeConfig`](mailai/src/mailai/config/schema.py) schema. Typical settings
+include IMAP defaults (control namespace, quarantine folder, configuration
+subjects), size limits for the control mails, filesystem paths for state and
+models, local LLM parameters, and optional feedback mailboxes.
+
+When running inside Docker place `config.cfg` under `/etc/mailai/`. Native
+deployments search the current working directory first and fall back to
+`/etc/mailai/config.cfg` and `/var/lib/mailai/config.cfg`. A reference document
+is available under [`examples/config.cfg`](../examples/config.cfg).
+
 ## IMAP YAML Configuration
 
 MailAI stores its configuration and diagnostics inside the IMAP account under a
-dedicated control namespace. By default the agent creates a `MailIA/`
+dedicated control namespace. By default the agent reuses the standard `Drafts`
 mailbox that contains two human-readable messages:
 
 - **`MailAI: rules.yaml`** – the authoritative configuration described by the
@@ -60,9 +74,10 @@ mailbox that contains two human-readable messages:
   metrics, privacy checks, and a `proposals` section where learner-generated
   rules are rendered as YAML diffs with an explanation.
 
-Both messages are limited to 128 KB. MailAI attempts to keep the payload below
-64 KB by truncating verbose sections such as `notes` and `proposals` while
-preserving the most relevant entries. Example documents are provided under
+Both messages inherit their soft and hard size limits from `config.cfg`. MailAI
+attempts to keep the payload below the soft ceiling by truncating verbose
+sections such as `notes` and `proposals` while preserving the most relevant
+entries. Example documents are provided under
 [`examples/rules.yaml`](../examples/rules.yaml) and
 [`examples/status.yaml`](../examples/status.yaml). Account bootstrap data for
 `accountctl` is illustrated in [`examples/accounts.yaml`](../examples/accounts.yaml).
