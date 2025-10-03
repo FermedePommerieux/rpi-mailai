@@ -1,28 +1,54 @@
+# Version control
 .git
-.github
 .gitignore
-.env
-__pycache__
+
+# GitHub metadata
+.github/
+
+# Python caches & artifacts
+__pycache__/
 *.py[cod]
-*.egg-info
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.eggs/
+*.egg
+build/
+dist/
+pip-wheel-metadata/
+.pytest_cache/
+.cache/
+htmlcov/
+.coverage
+
+# Virtual environments & tooling
+.venv/
+.env
+.env.*
+.poetry/
+.mypy_cache/
+.ruff_cache/
+.dmypy.json
+.pyre/
+
+# Logs & temporary files
 *.log
+*.tmp
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
-.idea
-.vscode
-build
-dist
-.eggs
-htmlcov
-.coverage
-.cache
-.pytest_cache
+
+# Project directories not needed in image
+examples/
+tests/
+compose/
+
+# Misc archives
 *.tgz
 *.tar
 *.gz
 *.zip
-node_modules
-examples
-tests
-compose
-Dockerfile
+*.bz2
+*.xz

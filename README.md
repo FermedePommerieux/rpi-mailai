@@ -5,51 +5,84 @@ lives under the [`mailai/`](mailai/) directory where you will find the project
 source, documentation, and packaging metadata. Refer to
 [`mailai/README.md`](mailai/README.md) for installation and usage instructions.
 
-## Docker (ARM64 + mandatory LLM)
+## Docker (ARM64 + mandatory in-container LLM)
 
-MailAI ships with an ARM64-only container workflow that requires a running
-local LLM at all times. The project targets Raspberry Pi 4B class hardware and
-does **not** provide any "LLM disabled" fallback path.
+MailAI ships with an ARM64-only container workflow that embeds
+`llama-cpp-python` inside the MailAI image. The project targets Raspberry Pi 4B
+class hardware and does **not** provide any "LLM disabled" fallback path. The
+container refuses to start unless it can load the local GGUF model and produce a
+short completion during the boot sequence.
 
 ### Prerequisites
 
 1. Use a 64-bit host capable of running `linux/arm64` containers (for example a
    Raspberry Pi 4B running a 64-bit OS).
-2. Download at least one GGUF model (e.g.
-   `phi-3-mini-q4_0.gguf`) into `./models/`.
+2. Download a quantised GGUF model compatible with `llama.cpp` and store it as
+   `./models/model.gguf` on the host.
 3. Provide configuration secrets in `./config/` and persistent state in
    `./data/`. Secrets inside `./config/` must be owned by your host user and
-   have permissions `0600` before starting the containers.
+   have permissions `0600` before starting the container.
 
-### Building and running
+### Quick start
+
+```bash
+mkdir -p models data config
+# Place your GGUF model at models/model.gguf
+cp /path/to/your-model.gguf models/model.gguf
+
+# Launch MailAI (LLM warmup will run automatically)
+docker compose -f compose/docker-compose.yml up -d
+```
 
 The supplied `Makefile` exposes helper targets for the hardened runtime:
 
 ```bash
-# Build the linux/arm64 image locally
-make build
-
-# Build with Buildx (linux/arm64) or push to a registry
+# Build the linux/arm64 image with Buildx
 make buildx-arm64
+
+# Build and push the linux/arm64 image to a registry
 make push-arm64
 
-# Launch the LLM server and MailAI runtime together
+# Start the service via Docker Compose (single container)
 make run
 ```
 
 `docker compose` uses the [`compose/docker-compose.yml`](compose/docker-compose.yml)
-definition which declares two services:
+definition which declares a single `mailai` service running the in-process LLM.
+The container mounts the following volumes:
 
-- `llama-server` – based on `ghcr.io/ggerganov/llama.cpp:server`, mounting the
-  read-only `./models` directory and exposing the OpenAI-compatible HTTP API.
-- `mailai` – the MailAI runtime image that depends on `llama-server` and reads
-  the model via `LLM_BASE_URL=http://llama-server:8080/v1`. Set
-  `LLM_HEALTH_MODEL` to the model identifier exposed by the server (defaults to
-  `phi-3-mini-q4_0.gguf` in the provided Compose file).
+- `./data` → `/var/lib/mailai` (read-write persistent state)
+- `./config` → `/etc/mailai` (read-only secrets and configuration)
+- `./models` → `/models` (read-only GGUF model directory)
 
-The MailAI entrypoint validates the mounted directories, enforces `0600`
-permissions on secrets, probes the LLM with a short completion request, and
-aborts the container if the LLM is unreachable. The container healthcheck also
-fails whenever the LLM endpoint stops responding, so stopping `llama-server`
-will mark MailAI as unhealthy and prevent successful restarts until the model
-is back online.
+### Required environment variables
+
+The container sets sensible defaults for most parameters. Provide the GGUF
+model via `LLM_MODEL_PATH` and override other variables as needed:
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `LLM_MODEL_PATH` | _(required)_ | Absolute path inside the container to the GGUF model (defaults to `/models/model.gguf` in Compose). |
+| `LLM_N_THREADS` | `3` | Number of CPU threads used by `llama-cpp-python` (tuned for Raspberry Pi 4B). |
+| `LLM_CTX_SIZE` | `2048` | Context window size for the embedded model. |
+| `MAILAI_ACCOUNTS` | `/etc/mailai/accounts.yaml` | Location of the IMAP account definitions. |
+| `MAILAI_LOG_LEVEL` | `INFO` | Log level emitted to stdout (JSON). |
+| `MAILAI_IMAP_TIMEOUT` | `30` | IMAP network timeout in seconds. |
+| `TZ` | `Europe/Paris` | Time zone for the container. |
+
+### Runtime guarantees
+
+- The entrypoint validates required volumes, enforces `0600` permissions on
+  secrets, and fails fast when directories are missing or misconfigured.
+- A warmup routine loads the GGUF model via `llama-cpp-python`, performs a tiny
+  completion (`"ok?"` with four tokens), and aborts the container if it cannot
+  complete within five seconds.
+- The healthcheck reuses the in-process integration and fails whenever the model
+  cannot be loaded or respond, ensuring orchestrators detect LLM regressions.
+- The root filesystem is kept read-only at runtime; only `/var/lib/mailai`
+  remains writable for stateful data. Logs are emitted to stdout in JSON format
+  without exposing secrets or email content.
+
+If the GGUF model is missing, renamed, or incompatible, MailAI terminates with a
+non-zero exit status. Restore the model to `/models/model.gguf` and restart the
+container to resume operation.
