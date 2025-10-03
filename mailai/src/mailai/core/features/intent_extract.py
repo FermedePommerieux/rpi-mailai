@@ -274,8 +274,12 @@ def _merge_llm_payload(target: Dict[str, object], payload: Dict[str, object]) ->
     for key in ("speech_acts", "persuasion", "suspicion_flags"):
         if key in payload:
             values = payload[key]
-            if isinstance(values, Iterable):
+            if isinstance(values, str):
+                target[key].append(values)
+            elif isinstance(values, Iterable):
                 target[key].extend(str(value) for value in values)
+            else:
+                target[key].append(str(values))
     for key in ("urgency_score", "insistence_score", "commercial_pressure", "scam_singularity"):
         if key in payload:
             candidate = int(payload[key])
