@@ -309,6 +309,35 @@ class RuntimeLLMConfig(BaseModel):
     healthcheck_timeout_s: int = Field(gt=0, default=5)
 
 
+class IntentFeaturesLLMConfig(BaseModel):
+    """Structured LLM runtime parameters for intent enrichment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    max_tokens: int = Field(gt=0, le=256, default=64)
+    temperature: float = Field(ge=0.0, le=1.0, default=0.0)
+    timeout_s: float = Field(gt=0.0, default=3.0)
+
+
+class IntentFeaturesThresholds(BaseModel):
+    """Thresholds controlling downstream reactions to enrichment scores."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    scam_singularity_quarantine: int = Field(ge=0, le=3, default=2)
+    urgency_warn: int = Field(ge=0, le=3, default=3)
+
+
+class IntentFeaturesConfig(BaseModel):
+    """Top-level toggle and settings for intent enrichment."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    llm: IntentFeaturesLLMConfig = Field(default_factory=IntentFeaturesLLMConfig)
+    thresholds: IntentFeaturesThresholds = Field(default_factory=IntentFeaturesThresholds)
+
+
 class RuntimeConfig(BaseModel):
     """Top-level runtime configuration derived from ``config.cfg``.
 
@@ -331,6 +360,7 @@ class RuntimeConfig(BaseModel):
       mail: Rules/status mailbox configuration.
       llm: Embedded LLM parameters.
       feedback: Optional feedback ingestion settings.
+      intent_features: Intent enrichment toggle and runtime parameters.
     """
 
     model_config = ConfigDict(extra="forbid")
@@ -341,6 +371,7 @@ class RuntimeConfig(BaseModel):
     mail: MailSettings
     llm: RuntimeLLMConfig
     feedback: FeedbackConfig = Field(default_factory=FeedbackConfig)
+    intent_features: IntentFeaturesConfig = Field(default_factory=IntentFeaturesConfig)
 
 
 def _ensure_dict(value: Any, name: str) -> Dict[str, Any]:

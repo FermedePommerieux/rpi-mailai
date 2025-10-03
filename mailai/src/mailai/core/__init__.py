@@ -39,6 +39,15 @@ __all__ = [
     "FeatureSketch",
     "extract_features",
     "hash_text_window",
+    "build_mail_feature_record",
+    "IntentFeatureSettings",
+    "IntentLLMSettings",
+    "IntentThresholds",
+    "IntentFeatures",
+    "MailFeatureRecord",
+    "ParsedMailMeta",
+    "TextStats",
+    "UrlInfo",
     "Example",
     "LearningCfg",
     "Metrics",
@@ -78,7 +87,20 @@ def __getattr__(name: str) -> Any:
         from . import engine
 
         return getattr(engine, name)
-    if name in {"FeatureSketch", "extract_features", "hash_text_window"}:
+    if name in {
+        "FeatureSketch",
+        "extract_features",
+        "hash_text_window",
+        "build_mail_feature_record",
+        "IntentFeatureSettings",
+        "IntentLLMSettings",
+        "IntentThresholds",
+        "IntentFeatures",
+        "MailFeatureRecord",
+        "ParsedMailMeta",
+        "TextStats",
+        "UrlInfo",
+    }:
         from . import features
 
         return getattr(features, name)

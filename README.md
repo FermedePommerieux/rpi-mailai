@@ -83,6 +83,26 @@ model via `LLM_MODEL_PATH` and override other variables as needed:
   remains writable for stateful data. Logs are emitted to stdout in JSON format
   without exposing secrets or email content.
 
+### Intent enrichment signals
+
+MailAI now records additional closed-vocabulary metadata describing the intent
+and tone of every processed message. The enrichment stage stores only
+identifiers and bounded scores (0..3) covering:
+
+- `intent` – coarse purpose such as `transactional`, `marketing`, or
+  `fraud_solicitation`.
+- `speech_acts` and `persuasion` – sets of whitelisted tactics detected via
+  heuristics and the local LLM.
+- `urgency_score`, `insistence_score`, `commercial_pressure`, and
+  `scam_singularity` – bounded integers driving routing/quarantine decisions.
+- `suspicion_flags` – closed vocabulary including `link_mismatch`,
+  `attachment_push`, and other high-signal heuristics.
+
+The optional enrichment pipeline is enabled through the new
+`intent_features` section in `config.cfg` (see `examples/config.yaml`). Messages
+exceeding the configured `scam_singularity_quarantine` threshold are isolated in
+the quarantine mailbox without ever persisting plaintext content.
+
 If the GGUF model is missing, renamed, or incompatible, MailAI terminates with a
 non-zero exit status. Restore the model to `/models/model.gguf` and restart the
 container to resume operation.

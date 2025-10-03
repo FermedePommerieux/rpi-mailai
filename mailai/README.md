@@ -14,6 +14,8 @@ and never persists cleartext email data.
 - Offline LLM integration via `llama.cpp` bindings for semantic inference and
   rule synthesis.
 - Encrypted feature store with peppered hashing and redact-only logging.
+- Intent enrichment pipeline producing closed-vocabulary tone/intent metadata
+  for routing, learning, and quarantine decisions without persisting plaintext.
 - CLI with `once`, `watch`, `learn-now`, and `diag` subcommands.
 
 ## Installation (Raspberry Pi 4B)
@@ -49,7 +51,9 @@ loader accepts either YAML or JSON and validates the payload against the
 [`RuntimeConfig`](mailai/src/mailai/config/schema.py) schema. Typical settings
 include IMAP defaults (control namespace, quarantine folder, configuration
 subjects), size limits for the control mails, filesystem paths for state and
-models, local LLM parameters, and optional feedback mailboxes.
+models, local LLM parameters, optional feedback mailboxes, and the
+`intent_features` block controlling token budgets, temperature, timeouts, and
+quarantine thresholds for the enrichment pipeline.
 
 When running inside Docker place `config.cfg` under `/etc/mailai/`. Native
 deployments search the current working directory first and fall back to
