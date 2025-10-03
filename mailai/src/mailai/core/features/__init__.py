@@ -37,8 +37,19 @@ from collections import Counter
 from dataclasses import dataclass
 from typing import Dict, List
 
-from ..utils.mime import parse_message
-from .privacy import PepperHasher
+from ...utils.mime import parse_message
+from .extract import build_mail_feature_record
+from ..privacy import PepperHasher
+from .schema import (
+    IntentFeatureSettings,
+    IntentFeatures,
+    IntentLLMSettings,
+    IntentThresholds,
+    MailFeatureRecord,
+    ParsedMailMeta,
+    TextStats,
+    UrlInfo,
+)
 
 
 @dataclass
@@ -201,6 +212,22 @@ def _extract_domains(headers: Dict[str, str]) -> Dict[str, int]:
             if domain:
                 domains[domain.lower()] += 1
     return dict(domains)
+
+
+__all__ = [
+    "FeatureSketch",
+    "extract_features",
+    "hash_text_window",
+    "build_mail_feature_record",
+    "IntentFeatureSettings",
+    "IntentLLMSettings",
+    "IntentThresholds",
+    "IntentFeatures",
+    "MailFeatureRecord",
+    "ParsedMailMeta",
+    "TextStats",
+    "UrlInfo",
+]
 
 
 # TODO: Other modules require the same treatment (What/Why/How docstrings + module header).
