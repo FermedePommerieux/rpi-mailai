@@ -1,0 +1,49 @@
+version: "3.9"
+
+services:
+  llama-server:
+    image: ghcr.io/ggerganov/llama.cpp:server
+    platform: linux/arm64
+    restart: unless-stopped
+    environment:
+      LLAMA_ARG_MODEL: /models/phi-3-mini-q4_0.gguf
+      LLAMA_ARG_CTX_SIZE: "2048"
+      LLAMA_ARG_N_THREADS: "3"
+    volumes:
+      - ../models:/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - "ALL"
+    security_opt:
+      - no-new-privileges:true
+
+  mailai:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: ghcr.io/mailai/rpi-mailai:latest
+    platform: linux/arm64
+    restart: unless-stopped
+    depends_on:
+      - llama-server
+    environment:
+      LLM_BASE_URL: http://llama-server:8080/v1
+      LLM_HEALTH_MODEL: phi-3-mini-q4_0.gguf
+    volumes:
+      - ../config:/etc/mailai:ro
+      - ../data:/var/lib/mailai:rw
+      - ../models:/models:ro
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - "ALL"
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
