@@ -14,9 +14,9 @@ services:
       - MAILAI_IMAP_TIMEOUT=30
       - TZ=Europe/Paris
     volumes:
-      - ./data:/var/lib/mailai:rw
-      - ./config:/etc/mailai:ro
-      - ./models:/models:ro
+      - ../data:/var/lib/mailai:rw
+      - ../config:/etc/mailai:ro
+      - ../models:/models:ro
     read_only: true
     tmpfs:
       - /tmp

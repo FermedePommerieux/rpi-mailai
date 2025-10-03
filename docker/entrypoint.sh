@@ -61,12 +61,16 @@ check_secrets() {
 
 warmup_llm() {
     log "warming up local LLM"
-    if ! timeout 5 python - <<'PY'; then
+    if ! python - <<'PY'; then
         fail "LLM warmup failed"
     fi
 PY
 import os
 from pathlib import Path
+import json
+import stat
+import time
+import signal
 
 from llama_cpp import Llama
 
@@ -89,6 +93,8 @@ llm = Llama(
     verbose=False,
 )
 try:
+    signal.signal(signal.SIGALRM, lambda _signum, _frame: (_ for _ in ()).throw(TimeoutError("completion timeout")))
+    signal.alarm(5)
     result = llm(
         "ok?",
         max_tokens=4,
@@ -98,11 +104,27 @@ try:
         return_dict=True,
     )
 finally:
+    signal.alarm(0)
     del llm
 
 choices = result.get("choices") if isinstance(result, dict) else None
 if not choices:
     raise SystemExit("warmup returned no choices")
+
+first_choice = choices[0]
+text = first_choice.get("text") if isinstance(first_choice, dict) else None
+
+sentinel_path = Path(os.environ.get("LLM_HEALTH_SENTINEL", "/var/lib/mailai/.cache/llm_ready.json"))
+sentinel_path.parent.mkdir(parents=True, exist_ok=True)
+payload = {
+    "model_path": str(model_file),
+    "threads": threads,
+    "ctx_size": ctx_size,
+    "completed_at": time.time(),
+    "response": text,
+}
+sentinel_path.write_text(json.dumps(payload, ensure_ascii=False))
+sentinel_path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 PY
     log "LLM warmup succeeded"
 }
@@ -111,7 +133,9 @@ MAILAI_VALIDATE=${MAILAI_VALIDATE:-0}
 LLM_MODEL_PATH=${LLM_MODEL_PATH:-}
 LLM_N_THREADS=${LLM_N_THREADS:-3}
 LLM_CTX_SIZE=${LLM_CTX_SIZE:-2048}
+LLM_HEALTH_SENTINEL=${LLM_HEALTH_SENTINEL:-/var/lib/mailai/.cache/llm_ready.json}
 export LLM_MODEL_PATH LLM_N_THREADS LLM_CTX_SIZE MAILAI_VALIDATE
+export LLM_HEALTH_SENTINEL
 
 require_dir /etc/mailai ro
 require_dir /var/lib/mailai rw
