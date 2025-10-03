@@ -1,4 +1,38 @@
-# Intent feature enrichment configuration snippet.
+version: 1
+paths:
+  state_dir: /var/lib/mailai
+  config_dir: /etc/mailai
+  models_dir: /var/lib/mailai/models
+imap:
+  default_mailbox: INBOX
+  control_namespace: Drafts
+  quarantine_subfolder: Quarantine
+mail:
+  rules:
+    subject: "MailAI: rules.yaml"
+    folder: Drafts
+    limits:
+      soft_limit: 65536
+      hard_limit: 131072
+  status:
+    subject: "MailAI: status.yaml"
+    folder: Drafts
+    limits:
+      soft_limit: 65536
+      hard_limit: 131072
+llm:
+  model_path: /var/lib/mailai/models/qwen2.5-3b-instruct-q4_0.gguf
+  threads: 3
+  ctx_size: 2048
+  sentinel_path: /var/lib/mailai/.cache/llm_ready.json
+  max_age: 86400
+  load_timeout_s: 180
+  warmup_completion_timeout_s: 20
+  healthcheck_timeout_s: 15
+feedback:
+  enabled: false
+  mailbox: Drafts/Feedback
+  subject_prefix: "MailAI Feedback"
 intent_features:
   enabled: true
   llm:

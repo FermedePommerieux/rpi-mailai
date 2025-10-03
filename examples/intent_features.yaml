@@ -1,0 +1,10 @@
+# Intent feature enrichment configuration snippet.
+intent_features:
+  enabled: true
+  llm:
+    max_tokens: 64
+    temperature: 0.0
+    timeout_s: 3
+  thresholds:
+    scam_singularity_quarantine: 2
+    urgency_warn: 3

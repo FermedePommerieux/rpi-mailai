@@ -2,7 +2,7 @@
 
 What:
   Provide helpers to locate, parse, validate, and serialise the runtime
-  configuration files (``config.cfg``, ``rules.yaml``, ``status.yaml``).
+  configuration files (``config.yaml``, ``rules.yaml``, ``status.yaml``).
 
 Why:
   Configuration lives outside the application bundle and can be malformed or
@@ -11,13 +11,13 @@ Why:
 
 How:
   Resolve candidate file locations based on explicit parameters, environment
-  variables, and defaults. Parse JSON/YAML payloads through the local YAML shim,
+  variables, and defaults. Parse YAML payloads through the local YAML shim,
   validate them using Pydantic models, and expose deterministic hashing to track
   changes across IMAP synchronisation cycles.
 
 Interfaces:
   - :func:`load_runtime_config` / :func:`get_runtime_config` /
-    :func:`reset_runtime_config`: Manage ``config.cfg`` discovery and caching.
+    :func:`reset_runtime_config`: Manage ``config.yaml`` discovery and caching.
   - :func:`load_rules` / :func:`load_status`: Parse YAML payloads embedded in
     IMAP messages into typed models.
   - :func:`dump_rules` / :func:`dump_status`: Serialise typed models back into
@@ -41,7 +41,6 @@ Safety/Performance:
 from __future__ import annotations
 
 import hashlib
-import json
 import os
 from dataclasses import dataclass
 from pathlib import Path
@@ -77,7 +76,7 @@ class ConfigLoadError(Exception):
 
 
 class RuntimeConfigError(ConfigLoadError):
-    """Error raised when ``config.cfg`` cannot be loaded or validated.
+    """Error raised when ``config.yaml`` cannot be loaded or validated.
 
     What:
       Signal issues related specifically to runtime configuration discovery or
@@ -138,9 +137,9 @@ class LoadedDocument:
 
 _CONFIG_ENV = "MAILAI_CONFIG_PATH"
 _DEFAULT_LOCATIONS: Tuple[Path, ...] = (
-    Path("config.cfg"),
-    Path("/etc/mailai/config.cfg"),
-    Path("/var/lib/mailai/config.cfg"),
+    Path("config.yaml"),
+    Path("/etc/mailai/config.yaml"),
+    Path("/var/lib/mailai/config.yaml"),
 )
 _RUNTIME_CACHE: Optional[Tuple[Path, RuntimeConfig]] = None
 
@@ -150,7 +149,7 @@ def _candidate_paths(path: Optional[Path]) -> Iterable[Path]:
 
     What:
       Produce the ordered list of paths that should be inspected for
-      ``config.cfg``.
+      ``config.yaml``.
 
     Why:
       The runtime allows operators to override the configuration path through a
@@ -191,19 +190,20 @@ def _candidate_paths(path: Optional[Path]) -> Iterable[Path]:
 
 
 def _parse_config_payload(text: str, source: Path) -> dict[str, Any]:
-    """Parse ``config.cfg`` text into a dictionary payload.
+    """Parse ``config.yaml`` text into a dictionary payload.
 
     What:
       Convert raw configuration text to a Python mapping ready for validation.
 
     Why:
-      ``config.cfg`` may be JSON or YAML depending on operator preference. This
-      helper abstracts the parsing logic while providing precise error messages.
+      ``config.yaml`` is the canonical runtime document. Centralising YAML
+      parsing enforces consistent error messages and prevents callers from
+      bypassing schema checks with alternative formats.
 
     How:
-      Detect JSON either by file suffix or leading ``{``, otherwise delegate to
-      the YAML shim. Wrap decoding errors in :class:`RuntimeConfigError` to
-      include filename context, and verify the top-level structure is a mapping.
+      Delegate to the YAML shim for decoding, wrap any parsing issues in
+      :class:`RuntimeConfigError` that includes file context, and verify the
+      resulting object is a mapping before returning it.
 
     Args:
       text: Raw configuration contents.
@@ -217,24 +217,17 @@ def _parse_config_payload(text: str, source: Path) -> dict[str, Any]:
       mapping.
     """
 
-    stripped = text.lstrip()
-    if source.suffix.lower() == ".json" or stripped.startswith("{"):
-        try:
-            payload = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise RuntimeConfigError(f"Invalid JSON in {source}: {exc}") from exc
-    else:
-        try:
-            payload = yamlshim.load(text.encode("utf-8")) or {}
-        except Exception as exc:
-            raise RuntimeConfigError(f"Invalid YAML in {source}: {exc}") from exc
+    try:
+        payload = yamlshim.load(text.encode("utf-8")) or {}
+    except Exception as exc:
+        raise RuntimeConfigError(f"Invalid YAML in {source}: {exc}") from exc
     if not isinstance(payload, dict):
-        raise RuntimeConfigError("config.cfg must contain a mapping at the top-level")
+        raise RuntimeConfigError("config.yaml must contain a mapping at the top-level")
     return payload
 
 
 def _load_runtime_from_path(path: Path) -> RuntimeConfig:
-    """Load and validate ``config.cfg`` from a specific path.
+    """Load and validate ``config.yaml`` from a specific path.
 
     What:
       Read the file at ``path`` and convert it into a validated
@@ -270,7 +263,7 @@ def _load_runtime_from_path(path: Path) -> RuntimeConfig:
     try:
         return RuntimeConfig.model_validate(payload)
     except _PydanticValidationError as exc:
-        raise RuntimeConfigError(f"Invalid config.cfg: {exc}") from exc
+        raise RuntimeConfigError(f"Invalid config.yaml: {exc}") from exc
 
 
 def load_runtime_config(
@@ -281,7 +274,7 @@ def load_runtime_config(
     """Resolve, parse, and cache the runtime configuration.
 
     What:
-      Locate ``config.cfg`` using the configured precedence chain, parse it, and
+      Locate ``config.yaml`` using the configured precedence chain, parse it, and
       return a validated :class:`RuntimeConfig` instance.
 
     Why:
@@ -295,7 +288,7 @@ def load_runtime_config(
       readable file is found, and store the successful result for future calls.
 
     Args:
-      path: Optional explicit location of ``config.cfg``.
+      path: Optional explicit location of ``config.yaml``.
       reload: When ``True`` forces a fresh load bypassing the cache.
 
     Returns:
@@ -324,7 +317,7 @@ def load_runtime_config(
         return config
 
     searched = ", ".join(errors) if errors else "<none>"
-    raise RuntimeConfigError(f"Unable to locate config.cfg (searched: {searched})")
+    raise RuntimeConfigError(f"Unable to locate config.yaml (searched: {searched})")
 
 
 def get_runtime_config() -> RuntimeConfig:

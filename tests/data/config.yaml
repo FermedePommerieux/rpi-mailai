@@ -26,16 +26,19 @@ llm:
   ctx_size: 2048
   sentinel_path: /var/lib/mailai/.cache/llm_ready.json
   max_age: 86400
-  # Maximum number of seconds allowed for the llama.cpp bindings to initialise
-  # the quantised model during warm-up.
   load_timeout_s: 180
-  # Deadline for the warm-up completion request which exercises the model with a
-  # short prompt.
   warmup_completion_timeout_s: 20
-  # Timeout applied to the standalone `mailai-health-llm` probe when verifying
-  # the cached sentinel contents.
   healthcheck_timeout_s: 15
 feedback:
   enabled: false
   mailbox: Drafts/Feedback
   subject_prefix: "MailAI Feedback"
+intent_features:
+  enabled: true
+  llm:
+    max_tokens: 64
+    temperature: 0.0
+    timeout_s: 3
+  thresholds:
+    scam_singularity_quarantine: 2
+    urgency_warn: 3
