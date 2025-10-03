@@ -18,7 +18,7 @@ How:
 
 import pytest
 
-from mailai.core.features.intent_extract import infer_intent_and_tone
+from mailai.core.features.intent_extract import _merge_llm_payload, infer_intent_and_tone
 from mailai.core.features.schema import IntentLLMSettings, ParsedMailMeta, TextStats, UrlInfo
 from mailai.utils.privacy import PrivacyViolation, assert_bounded_scores, assert_closed_vocab
 
@@ -59,3 +59,23 @@ def test_link_mismatch_flag() -> None:
     urls = UrlInfo(target_domains=("phish.test",))
     result = infer_intent_and_tone(meta, stats, urls)
     assert "link_mismatch" in result["suspicion_flags"]
+
+
+def test_merge_llm_payload_scalar_speech_act() -> None:
+    """What/Why/How: scalar speech-act tokens must remain intact during merge."""
+
+    target = {
+        "intent": "unknown",
+        "speech_acts": ["inform"],
+        "persuasion": [],
+        "suspicion_flags": [],
+        "urgency_score": 0,
+        "insistence_score": 0,
+        "commercial_pressure": 0,
+        "scam_singularity": 0,
+    }
+    payload = {"speech_acts": "request"}
+
+    _merge_llm_payload(target, payload)
+
+    assert target["speech_acts"] == ["inform", "request"]
